@@ -1,0 +1,21 @@
+{
+  // OAuth-gated variant of the worker, for Claude.ai web custom connectors.
+  // Deploy with:  npx wrangler deploy -c wrangler.oauth.jsonc
+  //
+  // Create the KV namespace first and paste its id below:
+  //   npx wrangler kv namespace create OAUTH_KV
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "zoho-analytics-mcp-oauth",
+  "main": "src/oauth.ts",
+  "compatibility_date": "2025-05-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "MCP_OBJECT", "class_name": "ZohoAnalyticsMCP" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ZohoAnalyticsMCP"] }],
+  "kv_namespaces": [
+    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+  ],
+  "alias": { "ai": "./src/ai-stub.ts" },
+  "observability": { "enabled": true }
+}

@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "zoho-analytics-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-05-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "MCP_OBJECT", "class_name": "ZohoAnalyticsMCP" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ZohoAnalyticsMCP"] }],
+  "alias": { "ai": "./src/ai-stub.ts" },
+  "observability": { "enabled": true }
+}

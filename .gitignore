@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Wrangler local state & secrets
+.wrangler/
+.dev.vars
+.dev.vars.*
+
+# Build output
+dist/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor cruft
+.DS_Store

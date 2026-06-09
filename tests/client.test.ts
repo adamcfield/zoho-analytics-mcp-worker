@@ -1,0 +1,230 @@
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { ZohoAnalyticsClient, ZohoAnalyticsError, mapLimit } from "../src/zohoanalytics.js";
+
+/** Client using a static access token — skips the OAuth refresh roundtrip. */
+const mkStatic = () =>
+  new ZohoAnalyticsClient({ accessToken: "tok", orgId: "o", dc: "com", backoffBaseMs: 1, maxRetries: 2 });
+
+/** Client using refresh credentials — exercises the token endpoint. */
+const mkRefresh = () =>
+  new ZohoAnalyticsClient({
+    clientId: "c",
+    clientSecret: "s",
+    refreshToken: "r",
+    orgId: "o",
+    dc: "com",
+    backoffBaseMs: 1,
+    maxRetries: 2,
+  });
+
+type Resp = { status: number; body: string; headers?: Record<string, string> };
+function mockSequence(responses: Resp[]) {
+  let i = 0;
+  return vi.fn(async () => {
+    const r = responses[Math.min(i, responses.length - 1)];
+    i++;
+    return new Response(r.body, { status: r.status, headers: r.headers });
+  });
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
+describe("constructor", () => {
+  it("throws without refresh creds or a static token", () => {
+    expect(() => new ZohoAnalyticsClient({})).toThrow(/refreshToken|accessToken/);
+  });
+  it("throws on an unknown data center", () => {
+    expect(() => new ZohoAnalyticsClient({ accessToken: "t", dc: "mars" })).toThrow(/data center/i);
+  });
+});
+
+describe("request (JSON envelope)", () => {
+  it("returns the parsed envelope on 200", async () => {
+    vi.stubGlobal("fetch", mockSequence([{ status: 200, body: JSON.stringify({ status: "success", data: { orgs: [] } }) }]));
+    expect(await mkStatic().getOrgs()).toMatchObject({ status: "success" });
+  });
+
+  it("throws ZohoAnalyticsError carrying status + errorCode on an HTTP 4xx envelope", async () => {
+    vi.stubGlobal(
+      "fetch",
+      mockSequence([{ status: 400, body: JSON.stringify({ status: "failure", data: { errorCode: 7103, errorMessage: "no such view" } }) }]),
+    );
+    await expect(mkStatic().getWorkspaceDetails("w")).rejects.toMatchObject({
+      name: "ZohoAnalyticsError",
+      status: 400,
+      errorCode: 7103,
+    });
+  });
+
+  it("throws on a status:failure envelope even with HTTP 200", async () => {
+    vi.stubGlobal(
+      "fetch",
+      mockSequence([{ status: 200, body: JSON.stringify({ status: "failure", data: { errorCode: 8504, errorMessage: "bad name" } }) }]),
+    );
+    await expect(mkStatic().getOrgs()).rejects.toMatchObject({ errorCode: 8504 });
+  });
+
+  it("retries an idempotent GET on 429, then succeeds", async () => {
+    const f = mockSequence([
+      { status: 429, body: "", headers: { "retry-after": "0" } },
+      { status: 200, body: JSON.stringify({ status: "success", data: {} }) },
+    ]);
+    vi.stubGlobal("fetch", f);
+    await mkStatic().getOrgs();
+    expect(f).toHaveBeenCalledTimes(2);
+  });
+
+  it("never retries a write (no double-insert), even on 500", async () => {
+    const f = mockSequence([{ status: 500, body: "boom" }]);
+    vi.stubGlobal("fetch", f);
+    await expect(mkStatic().addRow("w", "v", { columns: { a: 1 } })).rejects.toMatchObject({ status: 500 });
+    expect(f).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("CONFIG + headers", () => {
+  it("URL-encodes CONFIG as a JSON query param and sends the auth + org headers", async () => {
+    const f = vi.fn(async () => new Response(JSON.stringify({ status: "success", data: { views: [] } }), { status: 200 }));
+    vi.stubGlobal("fetch", f);
+    await mkStatic().getViews("WS", { keyword: "sales" });
+    const [url, init] = f.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain("/restapi/v2/workspaces/WS/views");
+    expect(url).toContain("CONFIG=");
+    expect(decodeURIComponent(url)).toContain('{"keyword":"sales"}');
+    const headers = init.headers as Record<string, string>;
+    expect(headers.Authorization).toBe("Zoho-oauthtoken tok");
+    expect(headers["ZANALYTICS-ORGID"]).toBe("o");
+  });
+});
+
+describe("requestRaw (export / download)", () => {
+  it("returns the raw body for a successful export", async () => {
+    vi.stubGlobal("fetch", mockSequence([{ status: 200, body: "Region,Sales\nEast,100" }]));
+    expect(await mkStatic().exportData("w", "v", { responseFormat: "csv" })).toBe("Region,Sales\nEast,100");
+  });
+
+  it("throws when the export comes back as a failure envelope", async () => {
+    vi.stubGlobal(
+      "fetch",
+      mockSequence([{ status: 200, body: JSON.stringify({ status: "failure", data: { errorCode: 8120, errorMessage: "export failed" } }) }]),
+    );
+    await expect(mkStatic().exportData("w", "v", { responseFormat: "json" })).rejects.toMatchObject({ errorCode: 8120 });
+  });
+});
+
+describe("OAuth token refresh", () => {
+  it("mints an access token via the accounts endpoint, then caches it", async () => {
+    let tokenCalls = 0;
+    const f = vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      if (u.includes("/oauth/v2/token")) {
+        tokenCalls++;
+        return new Response(JSON.stringify({ access_token: "AT1", expires_in: 3600 }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", f);
+    const c = mkRefresh();
+    await c.getOrgs();
+    await c.getOrgs();
+    expect(tokenCalls).toBe(1); // cached across the second call
+    const tokenCall = f.mock.calls.find((call) => String(call[0]).includes("/oauth/v2/token"))!;
+    expect(String(tokenCall[0])).toContain("grant_type=refresh_token");
+    const apiCall = f.mock.calls.find((call) => String(call[0]).includes("/restapi/v2/orgs"))!;
+    expect((apiCall[1] as RequestInit).headers).toMatchObject({ Authorization: "Zoho-oauthtoken AT1" });
+  });
+
+  it("refreshes once and retries when the API returns 401", async () => {
+    let tokenCalls = 0;
+    let apiCalls = 0;
+    const f = vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      if (u.includes("/oauth/v2/token")) {
+        tokenCalls++;
+        return new Response(JSON.stringify({ access_token: `AT${tokenCalls}`, expires_in: 3600 }), { status: 200 });
+      }
+      apiCalls++;
+      if (apiCalls === 1) return new Response("unauthorized", { status: 401 });
+      return new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", f);
+    await mkRefresh().getOrgs();
+    expect(tokenCalls).toBe(2); // initial mint + one refresh after 401
+    expect(apiCalls).toBe(2); // 401, then retried success
+  });
+
+  it("surfaces an OAuth failure (error field with HTTP 200)", async () => {
+    vi.stubGlobal("fetch", mockSequence([{ status: 200, body: JSON.stringify({ error: "invalid_code" }) }]));
+    await expect(mkRefresh().getOrgs()).rejects.toThrow(/invalid_code/);
+  });
+
+  it("never calls the token endpoint when a static token is supplied", async () => {
+    const f = vi.fn(async () => new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 }));
+    vi.stubGlobal("fetch", f);
+    await mkStatic().getOrgs();
+    expect(f.mock.calls.some((call) => String(call[0]).includes("/oauth/v2/token"))).toBe(false);
+  });
+});
+
+describe("data-center routing", () => {
+  it("targets the EU domains when dc=eu", async () => {
+    let tokenUrl = "";
+    let apiUrl = "";
+    const f = vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      if (u.includes("/oauth/v2/token")) {
+        tokenUrl = u;
+        return new Response(JSON.stringify({ access_token: "AT", expires_in: 3600 }), { status: 200 });
+      }
+      apiUrl = u;
+      return new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", f);
+    await new ZohoAnalyticsClient({ clientId: "c", clientSecret: "s", refreshToken: "r", dc: "eu", backoffBaseMs: 1 }).getOrgs();
+    expect(tokenUrl).toContain("accounts.zoho.eu");
+    expect(apiUrl).toContain("analyticsapi.zoho.eu");
+  });
+});
+
+describe("mapLimit", () => {
+  it("preserves input order and caps concurrency", async () => {
+    let active = 0;
+    let peak = 0;
+    const items = Array.from({ length: 12 }, (_, i) => i);
+    const out = await mapLimit(items, 3, async (n) => {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((r) => setTimeout(r, 2));
+      active--;
+      return n * 2;
+    });
+    expect(out).toEqual(items.map((n) => n * 2));
+    expect(peak).toBeLessThanOrEqual(3);
+    expect(peak).toBeGreaterThan(1);
+  });
+
+  it("handles an empty list", async () => {
+    expect(await mapLimit([], 4, async () => 1)).toEqual([]);
+  });
+
+  it("rejects if any task throws", async () => {
+    await expect(
+      mapLimit([1, 2, 3], 2, async (n) => {
+        if (n === 2) throw new Error("boom");
+        return n;
+      }),
+    ).rejects.toThrow("boom");
+  });
+});
+
+describe("ZohoAnalyticsError", () => {
+  it("includes method, path, status and errorCode in the message", () => {
+    const e = new ZohoAnalyticsError(404, 7103, "not found", "GET", "/workspaces/x");
+    expect(e.message).toContain("GET /workspaces/x");
+    expect(e.message).toContain("404");
+    expect(e.message).toContain("7103");
+  });
+});
