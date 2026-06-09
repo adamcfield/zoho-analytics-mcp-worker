@@ -745,4 +745,1229 @@ export function registerTools(
       return run(() => client.deleteView(workspace_id, view_id));
     },
   );
+
+  // Merge advanced/passthrough CONFIG keys into a base config object.
+  const adv = (base: Record<string, unknown>, options?: Record<string, unknown>) => ({ ...base, ...(options ?? {}) });
+  const ID = (label: string) => z.string().describe(label);
+  const emails = z.array(z.string()).describe("Email address(es).");
+  const advOpt = z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe("Advanced CONFIG keys merged into the request (see Zoho Analytics API docs for the full list).");
+
+  // ============================ Discovery (reads) ============================
+
+  server.registerTool(
+    "zoho_list_folders",
+    {
+      description: "List the folders in a workspace (folders group views).",
+      inputSchema: { workspace_id: ID("Workspace id.") },
+      annotations: { title: "List folders", ...READ_ONLY },
+    },
+    async ({ workspace_id }) => run(() => client.getFolders(workspace_id)),
+  );
+
+  server.registerTool(
+    "zoho_list_dashboards",
+    {
+      description: "List dashboards across the org (owned + shared).",
+      inputSchema: {},
+      annotations: { title: "List dashboards", ...READ_ONLY },
+    },
+    async () => run(() => client.getDashboards()),
+  );
+
+  server.registerTool(
+    "zoho_list_recent_views",
+    {
+      description: "List recently accessed views.",
+      inputSchema: {},
+      annotations: { title: "List recent views", ...READ_ONLY },
+    },
+    async () => run(() => client.getRecentViews()),
+  );
+
+  server.registerTool(
+    "zoho_get_view_metadata",
+    {
+      description: "Get a table/view's column metadata (data types etc.).",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id.") },
+      annotations: { title: "Get view metadata", ...READ_ONLY },
+    },
+    async ({ workspace_id, view_id }) => run(() => client.getViewMetadata(workspace_id, view_id)),
+  );
+
+  server.registerTool(
+    "zoho_get_trash",
+    {
+      description: "List the views currently in a workspace's trash (with who/when deleted). Restore with zoho_restore_view.",
+      inputSchema: { workspace_id: ID("Workspace id.") },
+      annotations: { title: "Get trash", ...READ_ONLY },
+    },
+    async ({ workspace_id }) => run(() => client.getTrashViews(workspace_id)),
+  );
+
+  server.registerTool(
+    "zoho_list_datasources",
+    {
+      description: "List the data sources backing a view (sync status, schedule, etc.).",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id.") },
+      annotations: { title: "List datasources", ...READ_ONLY },
+    },
+    async ({ workspace_id, view_id }) => run(() => client.getDatasources(workspace_id, view_id)),
+  );
+
+  // ============================ Modeling: query tables & reports ============================
+
+  writeTool(
+    "zoho_create_query_table",
+    {
+      description: "Create a query table — a saved, SQL-backed view you can read like any table. Provide the SQL and a name.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        sql_query: z.string().describe('SQL SELECT, with quoted identifiers: SELECT "col" FROM "Table".'),
+        query_table_name: z.string().describe("Name for the new query table."),
+        description: z.string().optional(),
+        folder_id: z.string().optional(),
+      },
+      annotations: { title: "Create query table", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, sql_query, query_table_name, description, folder_id }) => {
+      audit("create_query_table", { workspace_id, query_table_name });
+      return run(() =>
+        client.createQueryTable(workspace_id, {
+          sqlQuery: sql_query,
+          queryTableName: query_table_name,
+          ...(description ? { description } : {}),
+          ...(folder_id ? { folderId: folder_id } : {}),
+        }),
+      );
+    },
+  );
+
+  writeTool(
+    "zoho_edit_query_table",
+    {
+      description: "Edit an existing query table's SQL (and optionally move it to a folder).",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        query_table_id: ID("Query table view id."),
+        sql_query: z.string().describe("New SQL SELECT."),
+        folder_id: z.string().optional(),
+      },
+      annotations: { title: "Edit query table", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, query_table_id, sql_query, folder_id }) =>
+      run(() => client.editQueryTable(workspace_id, query_table_id, { sqlQuery: sql_query, ...(folder_id ? { folderId: folder_id } : {}) })),
+  );
+
+  writeTool(
+    "zoho_create_report",
+    {
+      description:
+        "Create a report (chart / pivot / summary) over a base table. report_type is chart|pivot|summary; for charts also pass chart_type (e.g. 'bar','line','pie'). axis_columns describes the axes — each item { type, columnName, operation } (chart types: xAxis/yAxis/...; pivot: row/column/data; summary: groupBy/summarize). Use options for filters/userFilters/merge settings.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        base_table_name: z.string().describe("Name of the base table to report on."),
+        title: z.string().describe("Report title."),
+        report_type: z.enum(["chart", "pivot", "summary"]).describe("Kind of report."),
+        chart_type: z.string().optional().describe("Chart type (required for report_type=chart), e.g. bar, line, pie, scatter."),
+        axis_columns: z.array(z.record(z.string(), z.unknown())).describe("Axis definitions: [{ type, columnName, operation }]."),
+        description: z.string().optional(),
+        options: advOpt,
+      },
+      annotations: { title: "Create report", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, base_table_name, title, report_type, chart_type, axis_columns, description, options }) => {
+      audit("create_report", { workspace_id, report_type });
+      return run(() =>
+        client.createReport(
+          workspace_id,
+          adv(
+            {
+              baseTableName: base_table_name,
+              title,
+              reportType: report_type,
+              ...(chart_type ? { chartType: chart_type } : {}),
+              axisColumns: axis_columns,
+              ...(description ? { description } : {}),
+            },
+            options,
+          ),
+        ),
+      );
+    },
+  );
+
+  writeTool(
+    "zoho_update_report",
+    {
+      description: "Update an existing report's title/type/axes. Pass axis_columns to redefine the axes; use options for filters and merge settings.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        report_id: ID("Report view id."),
+        title: z.string().optional(),
+        report_type: z.enum(["chart", "pivot", "summary"]).optional(),
+        axis_columns: z.array(z.record(z.string(), z.unknown())).optional(),
+        options: advOpt,
+      },
+      annotations: { title: "Update report", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, report_id, title, report_type, axis_columns, options }) =>
+      run(() =>
+        client.updateReport(
+          workspace_id,
+          report_id,
+          adv(
+            {
+              ...(title ? { title } : {}),
+              ...(report_type ? { reportType: report_type } : {}),
+              ...(axis_columns ? { axisColumns: axis_columns } : {}),
+            },
+            options,
+          ),
+        ),
+      ),
+  );
+
+  // ============================ Modeling: columns ============================
+
+  writeTool(
+    "zoho_add_column",
+    {
+      description:
+        "Add a column to a table. data_type is one of PLAIN, MULTI_LINE, EMAIL, NUMBER, POSITIVE_NUMBER, DECIMAL_NUMBER, CURRENCY, PERCENT, DATE, BOOLEAN, URL, AUTO_NUMBER, GEO, DURATION. For GEO pass geo_role (0-8).",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_id: ID("Table id."),
+        column_name: z.string().describe("New column name."),
+        data_type: z.enum(TABLE_DATATYPES).describe("Column data type."),
+        is_pii: z.boolean().optional().describe("Mark as a PII column."),
+        geo_role: z.number().int().min(0).max(8).optional().describe("Geo role (required when data_type=GEO)."),
+      },
+      annotations: { title: "Add column", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, column_name, data_type, is_pii, geo_role }) =>
+      run(() =>
+        client.addColumn(workspace_id, view_id, {
+          columnName: column_name,
+          dataType: data_type,
+          ...(is_pii != null ? { isPIIColumn: is_pii } : {}),
+          ...(geo_role != null ? { geoRole: geo_role } : {}),
+        }),
+      ),
+  );
+
+  writeTool(
+    "zoho_rename_column",
+    {
+      description: "Rename a column.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_id: ID("Table id."),
+        column_id: ID("Column id."),
+        column_name: z.string().describe("New column name."),
+      },
+      annotations: { title: "Rename column", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, column_id, column_name }) =>
+      run(() => client.renameColumn(workspace_id, view_id, column_id, { columnName: column_name })),
+  );
+
+  writeTool(
+    "zoho_delete_column",
+    {
+      description: "Delete a column. Set delete_dependent_views=true to also remove views that depend on it. Irreversible.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_id: ID("Table id."),
+        column_id: ID("Column id."),
+        delete_dependent_views: z.boolean().optional(),
+        dry_run: z.boolean().optional(),
+      },
+      annotations: { title: "Delete column", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, column_id, delete_dependent_views, dry_run }) => {
+      if (dry_run) return ok({ dry_run: true, action: "delete_column", view_id, column_id, note: "Nothing was deleted." });
+      audit("delete_column", { workspace_id, view_id, column_id });
+      return run(() =>
+        client.deleteColumn(workspace_id, view_id, column_id, delete_dependent_views ? { deleteDependentViews: true } : undefined),
+      );
+    },
+  );
+
+  writeTool(
+    "zoho_hide_columns",
+    {
+      description: "Hide one or more columns in a table.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("Table id."), column_ids: z.array(z.string()).min(1) },
+      annotations: { title: "Hide columns", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, column_ids }) => run(() => client.hideColumns(workspace_id, view_id, column_ids)),
+  );
+
+  writeTool(
+    "zoho_show_columns",
+    {
+      description: "Un-hide one or more columns in a table.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("Table id."), column_ids: z.array(z.string()).min(1) },
+      annotations: { title: "Show columns", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, column_ids }) => run(() => client.showColumns(workspace_id, view_id, column_ids)),
+  );
+
+  writeTool(
+    "zoho_reorder_columns",
+    {
+      description: "Reorder a table's columns. `columns` must list ALL column ids in the desired left-to-right order.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("Table id."), columns: z.array(z.string()).min(1).describe("All column ids, in order.") },
+      annotations: { title: "Reorder columns", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, columns }) => run(() => client.reorderColumns(workspace_id, view_id, columns)),
+  );
+
+  writeTool(
+    "zoho_add_lookup",
+    {
+      description: "Add a lookup from a column to a column in another table (creates a relationship).",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_id: ID("Table id (the child)."),
+        column_id: ID("Column id to turn into a lookup."),
+        reference_view_id: ID("Referenced table id."),
+        reference_column_id: ID("Referenced column id."),
+      },
+      annotations: { title: "Add lookup", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, column_id, reference_view_id, reference_column_id }) =>
+      run(() => client.addLookup(workspace_id, view_id, column_id, { referenceViewId: reference_view_id, referenceColumnId: reference_column_id })),
+  );
+
+  writeTool(
+    "zoho_remove_lookup",
+    {
+      description: "Remove a lookup relationship from a column.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_id: ID("Table id."),
+        column_id: ID("Column id."),
+        delete_dependent_views: z.boolean().optional(),
+      },
+      annotations: { title: "Remove lookup", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, column_id, delete_dependent_views }) =>
+      run(() => client.removeLookup(workspace_id, view_id, column_id, delete_dependent_views ? { deleteDependentViews: true } : undefined)),
+  );
+
+  // ============================ Modeling: formulas ============================
+
+  writeTool(
+    "zoho_add_formula_column",
+    {
+      description: "Add an inline formula column. Provide a name and a Zoho Analytics formula expression.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_id: ID("Table id."),
+        formula_name: z.string(),
+        expression: z.string().describe("Formula expression."),
+        description: z.string().optional(),
+      },
+      annotations: { title: "Add formula column", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, formula_name, expression, description }) =>
+      run(() => client.addFormulaColumn(workspace_id, view_id, { formulaName: formula_name, expression, ...(description ? { description } : {}) })),
+  );
+
+  writeTool(
+    "zoho_delete_formula_column",
+    {
+      description: "Delete an inline formula column by its formula id.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_id: ID("Table id."),
+        formula_id: ID("Formula id."),
+        delete_dependent_views: z.boolean().optional(),
+      },
+      annotations: { title: "Delete formula column", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, formula_id, delete_dependent_views }) =>
+      run(() => client.deleteFormulaColumn(workspace_id, view_id, formula_id, delete_dependent_views ? { deleteDependentViews: true } : undefined)),
+  );
+
+  writeTool(
+    "zoho_add_aggregate_formula",
+    {
+      description: "Add an aggregate formula to a table. Provide a name and an aggregate expression.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_id: ID("Table id."),
+        formula_name: z.string(),
+        expression: z.string().describe("Aggregate formula expression."),
+        description: z.string().optional(),
+      },
+      annotations: { title: "Add aggregate formula", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, formula_name, expression, description }) =>
+      run(() => client.addAggregateFormula(workspace_id, view_id, { formulaName: formula_name, expression, ...(description ? { description } : {}) })),
+  );
+
+  writeTool(
+    "zoho_delete_aggregate_formula",
+    {
+      description: "Delete an aggregate formula by its id.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_id: ID("Table id."),
+        formula_id: ID("Formula id."),
+        delete_dependent_views: z.boolean().optional(),
+      },
+      annotations: { title: "Delete aggregate formula", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, formula_id, delete_dependent_views }) =>
+      run(() => client.deleteAggregateFormula(workspace_id, view_id, formula_id, delete_dependent_views ? { deleteDependentViews: true } : undefined)),
+  );
+
+  // ============================ Modeling: folders ============================
+
+  writeTool(
+    "zoho_create_folder",
+    {
+      description: "Create a folder in a workspace.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        folder_name: z.string(),
+        folder_desc: z.string().optional(),
+        parent_folder_id: z.string().optional().describe("Make this a sub-folder of the given folder."),
+        make_default: z.boolean().optional(),
+      },
+      annotations: { title: "Create folder", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, folder_name, folder_desc, parent_folder_id, make_default }) =>
+      run(() =>
+        client.createFolder(workspace_id, {
+          folderName: folder_name,
+          ...(folder_desc ? { folderDesc: folder_desc } : {}),
+          ...(parent_folder_id ? { parentFolderId: parent_folder_id } : {}),
+          ...(make_default ? { makeDefaultFolder: true } : {}),
+        }),
+      ),
+  );
+
+  writeTool(
+    "zoho_rename_folder",
+    {
+      description: "Rename a folder (and optionally change its description).",
+      inputSchema: { workspace_id: ID("Workspace id."), folder_id: ID("Folder id."), folder_name: z.string(), folder_desc: z.string().optional() },
+      annotations: { title: "Rename folder", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, folder_id, folder_name, folder_desc }) =>
+      run(() => client.renameFolder(workspace_id, folder_id, { folderName: folder_name, ...(folder_desc ? { folderDesc: folder_desc } : {}) })),
+  );
+
+  writeTool(
+    "zoho_delete_folder",
+    {
+      description: "Delete a folder. Set delete_dependent_views=true to also remove dependent views. Irreversible.",
+      inputSchema: { workspace_id: ID("Workspace id."), folder_id: ID("Folder id."), delete_dependent_views: z.boolean().optional(), dry_run: z.boolean().optional() },
+      annotations: { title: "Delete folder", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, folder_id, delete_dependent_views, dry_run }) => {
+      if (dry_run) return ok({ dry_run: true, action: "delete_folder", folder_id, note: "Nothing was deleted." });
+      audit("delete_folder", { workspace_id, folder_id });
+      return run(() => client.deleteFolder(workspace_id, folder_id, delete_dependent_views ? { deleteDependentViews: true } : undefined));
+    },
+  );
+
+  // ============================ Modeling: view lifecycle ============================
+
+  writeTool(
+    "zoho_rename_view",
+    {
+      description: "Rename a view/table (and optionally change its description).",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), view_name: z.string(), view_desc: z.string().optional() },
+      annotations: { title: "Rename view", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, view_name, view_desc }) =>
+      run(() => client.renameView(workspace_id, view_id, { viewName: view_name, ...(view_desc ? { viewDesc: view_desc } : {}) })),
+  );
+
+  writeTool(
+    "zoho_save_as_view",
+    {
+      description: "Copy a view to a new view (optionally with its data and/or lookups, into a folder).",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_id: ID("Source view id."),
+        view_name: z.string().describe("Name for the copy."),
+        copy_with_data: z.boolean().optional(),
+        copy_with_lookup: z.boolean().optional(),
+        folder_id: z.string().optional(),
+      },
+      annotations: { title: "Save as (copy view)", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, view_name, copy_with_data, copy_with_lookup, folder_id }) =>
+      run(() =>
+        client.saveAsView(workspace_id, view_id, {
+          viewName: view_name,
+          ...(copy_with_data != null ? { copyWithData: copy_with_data } : {}),
+          ...(copy_with_lookup != null ? { copyWithLookup: copy_with_lookup } : {}),
+          ...(folder_id ? { folderId: folder_id } : {}),
+        }),
+      ),
+  );
+
+  writeTool(
+    "zoho_move_views_to_folder",
+    {
+      description: "Move one or more views into a folder.",
+      inputSchema: { workspace_id: ID("Workspace id."), folder_id: ID("Destination folder id."), view_ids: z.array(z.string()).min(1) },
+      annotations: { title: "Move views to folder", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, folder_id, view_ids }) => run(() => client.moveViewsToFolder(workspace_id, { folderId: folder_id, viewIds: view_ids })),
+  );
+
+  writeTool(
+    "zoho_restore_view",
+    {
+      description: "Restore a view from the trash. Set with_dependents=true to also restore dependent views.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id (from zoho_get_trash)."), with_dependents: z.boolean().optional() },
+      annotations: { title: "Restore view from trash", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, with_dependents }) =>
+      run(() => client.restoreTrashView(workspace_id, view_id, with_dependents ? { withDependents: true } : undefined)),
+  );
+
+  writeTool(
+    "zoho_delete_trash_view",
+    {
+      description: "PERMANENTLY delete a view that is already in the trash. Irreversible.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), with_dependents: z.boolean().optional(), dry_run: z.boolean().optional() },
+      annotations: { title: "Delete trash view (permanent)", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, with_dependents, dry_run }) => {
+      if (dry_run) return ok({ dry_run: true, action: "delete_trash_view", view_id, note: "Nothing was deleted." });
+      audit("delete_trash_view", { workspace_id, view_id });
+      return run(() => client.deleteTrashView(workspace_id, view_id, with_dependents ? { withDependents: true } : undefined));
+    },
+  );
+
+  writeTool(
+    "zoho_sort_data",
+    {
+      description: "Sort a view's stored data by one or more columns. sort_order 1=ascending, 2=descending. Set reset=true to clear sorting.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_id: ID("Table id."),
+        columns: z.array(z.string()).min(1).describe("Column names to sort by."),
+        sort_order: z.number().int().min(1).max(2).optional().describe("1=ascending (default), 2=descending."),
+        reset: z.boolean().optional(),
+      },
+      annotations: { title: "Sort data", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, columns, sort_order, reset }) =>
+      run(() => client.sortData(workspace_id, view_id, { columns, sortOrder: sort_order ?? 1, ...(reset ? { resetSort: true } : {}) })),
+  );
+
+  writeTool(
+    "zoho_create_table_from_data",
+    {
+      description: "Create a NEW table in a workspace from uploaded CSV/JSON text (Zoho infers the columns). Provide the table name and the file content.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        table_name: z.string().describe("Name for the new table."),
+        data: z.string().describe("File content (CSV or JSON text)."),
+        file_type: z.enum(["csv", "json"]).optional().describe("Format of `data` (default csv)."),
+        auto_identify: z.boolean().optional().describe("Auto-identify column data types (default true)."),
+        options: advOpt,
+      },
+      annotations: { title: "Create table from data", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, table_name, data, file_type, auto_identify, options }) => {
+      const fileType = file_type ?? "csv";
+      audit("create_table_from_data", { workspace_id, table_name, bytes: data.length });
+      return run(() =>
+        client.createTableFromData(
+          workspace_id,
+          { content: data, name: `${table_name}.${fileType}`, type: fileType === "json" ? "application/json" : "text/csv" },
+          adv({ tableName: table_name, fileType, autoIdentify: String(auto_identify ?? true) }, options),
+        ),
+      );
+    },
+  );
+
+  // ============================ Workspace admin ============================
+
+  writeTool(
+    "zoho_rename_workspace",
+    {
+      description: "Rename a workspace (and optionally change its description).",
+      inputSchema: { workspace_id: ID("Workspace id."), workspace_name: z.string(), workspace_desc: z.string().optional() },
+      annotations: { title: "Rename workspace", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, workspace_name, workspace_desc }) =>
+      run(() => client.renameWorkspace(workspace_id, { workspaceName: workspace_name, ...(workspace_desc ? { workspaceDesc: workspace_desc } : {}) })),
+  );
+
+  writeTool(
+    "zoho_delete_workspace",
+    {
+      description: "PERMANENTLY delete a workspace and everything in it. Workspaces are not trashed — this is irreversible. Always dry_run first.",
+      inputSchema: { workspace_id: ID("Workspace id."), dry_run: z.boolean().optional() },
+      annotations: { title: "Delete workspace (permanent)", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, dry_run }) => {
+      if (dry_run) return ok({ dry_run: true, action: "delete_workspace", workspace_id, note: "Nothing was deleted." });
+      audit("delete_workspace", { workspace_id });
+      return run(() => client.deleteWorkspace(workspace_id));
+    },
+  );
+
+  writeTool(
+    "zoho_copy_workspace",
+    {
+      description: "Copy a workspace to a new one. For a cross-org copy, pass dest_org_id and the source workspace_key (from zoho_get_workspace_secret_key).",
+      inputSchema: {
+        workspace_id: ID("Source workspace id."),
+        new_workspace_name: z.string(),
+        new_workspace_desc: z.string().optional(),
+        copy_with_data: z.boolean().optional(),
+        dest_org_id: z.string().optional().describe("Destination org id (cross-org copy)."),
+        workspace_key: z.string().optional().describe("Source workspace secret key (cross-org copy)."),
+      },
+      annotations: { title: "Copy workspace", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, new_workspace_name, new_workspace_desc, copy_with_data, dest_org_id, workspace_key }) => {
+      audit("copy_workspace", { workspace_id, dest_org_id: dest_org_id ?? null });
+      return run(() =>
+        client.copyWorkspace(
+          workspace_id,
+          {
+            newWorkspaceName: new_workspace_name,
+            ...(new_workspace_desc ? { newWorkspaceDesc: new_workspace_desc } : {}),
+            ...(copy_with_data != null ? { copyWithData: copy_with_data } : {}),
+            ...(workspace_key ? { workspaceKey: workspace_key } : {}),
+          },
+          dest_org_id,
+        ),
+      );
+    },
+  );
+
+  server.registerTool(
+    "zoho_get_workspace_secret_key",
+    {
+      description: "Get a workspace's secret key (used to authorize cross-org copies). Pass regenerate=true to rotate it.",
+      inputSchema: { workspace_id: ID("Workspace id."), regenerate: z.boolean().optional() },
+      annotations: { title: "Get workspace secret key", readOnlyHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, regenerate }) =>
+      run(() => client.getWorkspaceSecretKey(workspace_id, regenerate ? { regenerateKey: true } : undefined)),
+  );
+
+  writeTool(
+    "zoho_copy_views",
+    {
+      description: "Copy views to another workspace (and optionally another org). dest_org_id is required; pass workspace_key for cross-org.",
+      inputSchema: {
+        workspace_id: ID("Source workspace id."),
+        view_ids: z.array(z.string()).min(1),
+        dest_workspace_id: ID("Destination workspace id."),
+        dest_org_id: ID("Destination org id."),
+        copy_with_data: z.boolean().optional(),
+        workspace_key: z.string().optional(),
+      },
+      annotations: { title: "Copy views", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, view_ids, dest_workspace_id, dest_org_id, copy_with_data, workspace_key }) =>
+      run(() =>
+        client.copyViews(
+          workspace_id,
+          {
+            viewIds: view_ids,
+            destWorkspaceId: dest_workspace_id,
+            ...(copy_with_data != null ? { copyWithData: copy_with_data } : {}),
+            ...(workspace_key ? { workspaceKey: workspace_key } : {}),
+          },
+          dest_org_id,
+        ),
+      ),
+  );
+
+  // ============================ Sharing ============================
+
+  server.registerTool(
+    "zoho_get_shared_details",
+    {
+      description: "Get the sharing details for one or more views (who they're shared with and what permissions).",
+      inputSchema: { workspace_id: ID("Workspace id."), view_ids: z.array(z.string()).min(1) },
+      annotations: { title: "Get shared details", ...READ_ONLY },
+    },
+    async ({ workspace_id, view_ids }) => run(() => client.getSharedDetails(workspace_id, view_ids)),
+  );
+
+  server.registerTool(
+    "zoho_get_my_permissions",
+    {
+      description: "Get the current user's permissions on a specific view.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id.") },
+      annotations: { title: "Get my permissions", ...READ_ONLY },
+    },
+    async ({ workspace_id, view_id }) => run(() => client.getMyPermissions(workspace_id, view_id)),
+  );
+
+  writeTool(
+    "zoho_share_views",
+    {
+      description:
+        "Share one or more views with people (and/or groups). `permissions` is a map of booleans — `read` is required true; others include export, vud, addRow, updateRow, deleteRow, drillDown, share. Use options for criteria/invite-mail/column-level controls.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_ids: z.array(z.string()).min(1),
+        email_ids: emails,
+        permissions: z.record(z.string(), z.boolean()).describe("Permission map; include read:true."),
+        group_ids: z.array(z.string()).optional(),
+        invite_mail: z.boolean().optional(),
+        options: advOpt,
+      },
+      annotations: { title: "Share views", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, view_ids, email_ids, permissions, group_ids, invite_mail, options }) => {
+      audit("share_views", { workspace_id, views: view_ids.length, emails: email_ids.length });
+      return run(() =>
+        client.shareViews(
+          workspace_id,
+          adv(
+            {
+              viewIds: view_ids,
+              emailIds: email_ids,
+              permissions,
+              ...(group_ids ? { groupIds: group_ids } : {}),
+              ...(invite_mail != null ? { inviteMail: invite_mail } : {}),
+            },
+            options,
+          ),
+        ),
+      );
+    },
+  );
+
+  writeTool(
+    "zoho_update_shared_views",
+    {
+      description: "Update the permissions of an existing share (for the given emails/groups). `permissions` is a boolean map.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        email_ids: z.array(z.string()).optional(),
+        group_ids: z.array(z.string()).optional(),
+        permissions: z.record(z.string(), z.boolean()),
+        options: advOpt,
+      },
+      annotations: { title: "Update shared views", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, email_ids, group_ids, permissions, options }) =>
+      run(() =>
+        client.updateSharedViews(
+          workspace_id,
+          adv({ permissions, ...(email_ids ? { emailIds: email_ids } : {}), ...(group_ids ? { groupIds: group_ids } : {}) }, options),
+        ),
+      ),
+  );
+
+  writeTool(
+    "zoho_remove_share",
+    {
+      description: "Revoke sharing for the given emails. Pass view_ids to target specific views, or remove_all_views=true to revoke across the workspace.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        email_ids: emails,
+        view_ids: z.array(z.string()).optional(),
+        remove_all_views: z.boolean().optional(),
+        group_ids: z.array(z.string()).optional(),
+        dry_run: z.boolean().optional(),
+      },
+      annotations: { title: "Remove share", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, email_ids, view_ids, remove_all_views, group_ids, dry_run }) => {
+      if (!view_ids?.length && !remove_all_views) return fail("Provide view_ids, or remove_all_views=true.");
+      if (dry_run) return ok({ dry_run: true, action: "remove_share", email_ids, view_ids: view_ids ?? null, remove_all_views: !!remove_all_views, note: "Nothing was changed." });
+      audit("remove_share", { workspace_id, emails: email_ids.length });
+      return run(() =>
+        client.removeShare(workspace_id, {
+          emailIds: email_ids,
+          ...(view_ids ? { viewIds: view_ids } : {}),
+          ...(remove_all_views ? { removeAllViews: true } : {}),
+          ...(group_ids ? { groupIds: group_ids } : {}),
+        }),
+      );
+    },
+  );
+
+  server.registerTool(
+    "zoho_list_groups",
+    {
+      description: "List the sharing groups in a workspace.",
+      inputSchema: { workspace_id: ID("Workspace id.") },
+      annotations: { title: "List groups", ...READ_ONLY },
+    },
+    async ({ workspace_id }) => run(() => client.getGroups(workspace_id)),
+  );
+
+  writeTool(
+    "zoho_create_group",
+    {
+      description: "Create a sharing group with initial members.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        group_name: z.string(),
+        email_ids: emails,
+        group_desc: z.string().optional(),
+        invite_mail: z.boolean().optional(),
+      },
+      annotations: { title: "Create group", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, group_name, email_ids, group_desc, invite_mail }) =>
+      run(() =>
+        client.createGroup(workspace_id, {
+          groupName: group_name,
+          emailIds: email_ids,
+          ...(group_desc ? { groupDesc: group_desc } : {}),
+          ...(invite_mail != null ? { inviteMail: invite_mail } : {}),
+        }),
+      ),
+  );
+
+  writeTool(
+    "zoho_delete_group",
+    {
+      description: "Delete a sharing group.",
+      inputSchema: { workspace_id: ID("Workspace id."), group_id: ID("Group id."), dry_run: z.boolean().optional() },
+      annotations: { title: "Delete group", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, group_id, dry_run }) => {
+      if (dry_run) return ok({ dry_run: true, action: "delete_group", group_id, note: "Nothing was deleted." });
+      audit("delete_group", { workspace_id, group_id });
+      return run(() => client.deleteGroup(workspace_id, group_id));
+    },
+  );
+
+  writeTool(
+    "zoho_add_group_members",
+    {
+      description: "Add members to a sharing group.",
+      inputSchema: { workspace_id: ID("Workspace id."), group_id: ID("Group id."), email_ids: emails, invite_mail: z.boolean().optional() },
+      annotations: { title: "Add group members", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, group_id, email_ids, invite_mail }) =>
+      run(() => client.addGroupMembers(workspace_id, group_id, { emailIds: email_ids, ...(invite_mail != null ? { inviteMail: invite_mail } : {}) })),
+  );
+
+  writeTool(
+    "zoho_remove_group_members",
+    {
+      description: "Remove members from a sharing group.",
+      inputSchema: { workspace_id: ID("Workspace id."), group_id: ID("Group id."), email_ids: emails },
+      annotations: { title: "Remove group members", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, group_id, email_ids }) => run(() => client.removeGroupMembers(workspace_id, group_id, { emailIds: email_ids })),
+  );
+
+  server.registerTool(
+    "zoho_get_workspace_admins",
+    {
+      description: "List the admins of a workspace.",
+      inputSchema: { workspace_id: ID("Workspace id.") },
+      annotations: { title: "Get workspace admins", ...READ_ONLY },
+    },
+    async ({ workspace_id }) => run(() => client.getWorkspaceAdmins(workspace_id)),
+  );
+
+  writeTool(
+    "zoho_add_workspace_admins",
+    {
+      description: "Add workspace admins by email.",
+      inputSchema: { workspace_id: ID("Workspace id."), email_ids: emails, invite_mail: z.boolean().optional() },
+      annotations: { title: "Add workspace admins", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, email_ids, invite_mail }) =>
+      run(() => client.addWorkspaceAdmins(workspace_id, { emailIds: email_ids, ...(invite_mail != null ? { inviteMail: invite_mail } : {}) })),
+  );
+
+  writeTool(
+    "zoho_remove_workspace_admins",
+    {
+      description: "Remove workspace admins by email.",
+      inputSchema: { workspace_id: ID("Workspace id."), email_ids: emails },
+      annotations: { title: "Remove workspace admins", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, email_ids }) => run(() => client.removeWorkspaceAdmins(workspace_id, { emailIds: email_ids })),
+  );
+
+  server.registerTool(
+    "zoho_get_org_admins",
+    {
+      description: "List the organization admins.",
+      inputSchema: {},
+      annotations: { title: "Get org admins", ...READ_ONLY },
+    },
+    async () => run(() => client.getOrgAdmins()),
+  );
+
+  // ============================ User management ============================
+
+  server.registerTool(
+    "zoho_list_users",
+    {
+      description: "List the users in the organization (email, status, role).",
+      inputSchema: {},
+      annotations: { title: "List users", ...READ_ONLY },
+    },
+    async () => run(() => client.getUsers()),
+  );
+
+  server.registerTool(
+    "zoho_get_subscription",
+    {
+      description: "Get the org's subscription/plan details.",
+      inputSchema: {},
+      annotations: { title: "Get subscription", ...READ_ONLY },
+    },
+    async () => run(() => client.getSubscription()),
+  );
+
+  server.registerTool(
+    "zoho_get_resources",
+    {
+      description: "Get the org's resource usage (allocated / used / remaining).",
+      inputSchema: {},
+      annotations: { title: "Get resources", ...READ_ONLY },
+    },
+    async () => run(() => client.getResources()),
+  );
+
+  server.registerTool(
+    "zoho_list_workspace_users",
+    {
+      description: "List the users of a specific workspace (email, status, role).",
+      inputSchema: { workspace_id: ID("Workspace id.") },
+      annotations: { title: "List workspace users", ...READ_ONLY },
+    },
+    async ({ workspace_id }) => run(() => client.getWorkspaceUsers(workspace_id)),
+  );
+
+  writeTool(
+    "zoho_add_users",
+    {
+      description: "Add users to the organization. role is USER (default), VIEWER, or ORGADMIN.",
+      inputSchema: { email_ids: emails, role: z.enum(["USER", "VIEWER", "ORGADMIN"]).optional() },
+      annotations: { title: "Add users", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ email_ids, role }) => {
+      audit("add_users", { count: email_ids.length, role: role ?? "USER" });
+      return run(() => client.addUsers({ emailIds: email_ids, ...(role ? { role } : {}) }));
+    },
+  );
+
+  writeTool(
+    "zoho_remove_users",
+    {
+      description: "Remove users from the organization. Irreversible (re-add to restore access).",
+      inputSchema: { email_ids: emails, dry_run: z.boolean().optional() },
+      annotations: { title: "Remove users", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ email_ids, dry_run }) => {
+      if (dry_run) return ok({ dry_run: true, action: "remove_users", email_ids, note: "Nothing was changed." });
+      audit("remove_users", { count: email_ids.length });
+      return run(() => client.removeUsers({ emailIds: email_ids }));
+    },
+  );
+
+  writeTool(
+    "zoho_set_users_status",
+    {
+      description: "Activate or deactivate org users. status='active' or 'inactive'.",
+      inputSchema: { email_ids: emails, status: z.enum(["active", "inactive"]).describe("Target status.") },
+      annotations: { title: "Set users status", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ email_ids, status }) =>
+      run(() => (status === "active" ? client.activateUsers({ emailIds: email_ids }) : client.deactivateUsers({ emailIds: email_ids }))),
+  );
+
+  writeTool(
+    "zoho_change_user_role",
+    {
+      description: "Change org users' role: USER, VIEWER, or ORGADMIN.",
+      inputSchema: { email_ids: emails, role: z.enum(["USER", "VIEWER", "ORGADMIN"]) },
+      annotations: { title: "Change user role", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ email_ids, role }) => run(() => client.changeUserRole({ emailIds: email_ids, role })),
+  );
+
+  writeTool(
+    "zoho_add_workspace_users",
+    {
+      description: "Add users to a workspace. role is USER, WORKSPACEADMIN, or a custom role name.",
+      inputSchema: { workspace_id: ID("Workspace id."), email_ids: emails, role: z.string().optional() },
+      annotations: { title: "Add workspace users", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, email_ids, role }) =>
+      run(() => client.addWorkspaceUsers(workspace_id, { emailIds: email_ids, ...(role ? { role } : {}) })),
+  );
+
+  writeTool(
+    "zoho_remove_workspace_users",
+    {
+      description: "Remove users from a workspace.",
+      inputSchema: { workspace_id: ID("Workspace id."), email_ids: emails },
+      annotations: { title: "Remove workspace users", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, email_ids }) => run(() => client.deleteWorkspaceUsers(workspace_id, { emailIds: email_ids })),
+  );
+
+  writeTool(
+    "zoho_change_workspace_user_status",
+    {
+      description: "Activate or deactivate workspace users. operation='activate' or 'deactivate'.",
+      inputSchema: { workspace_id: ID("Workspace id."), email_ids: emails, operation: z.enum(["activate", "deactivate"]) },
+      annotations: { title: "Change workspace user status", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, email_ids, operation }) =>
+      run(() => client.changeWorkspaceUsersStatus(workspace_id, { emailIds: email_ids, operation })),
+  );
+
+  writeTool(
+    "zoho_change_workspace_user_role",
+    {
+      description: "Change workspace users' role: USER, WORKSPACEADMIN, or a custom role name.",
+      inputSchema: { workspace_id: ID("Workspace id."), email_ids: emails, role: z.string().describe("USER | WORKSPACEADMIN | <custom role>.") },
+      annotations: { title: "Change workspace user role", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, email_ids, role }) => run(() => client.changeWorkspaceUsersRole(workspace_id, { emailIds: email_ids, role })),
+  );
+
+  // ============================ Embed / publish ============================
+
+  server.registerTool(
+    "zoho_get_view_url",
+    {
+      description: "Get a shareable open-view URL for a view. Use options for title/toolbar/legend display flags.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), options: advOpt },
+      annotations: { title: "Get view URL", readOnlyHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, options }) => run(() => client.getViewUrl(workspace_id, view_id, options)),
+  );
+
+  server.registerTool(
+    "zoho_get_embed_url",
+    {
+      description: "Get an embed URL for a view (embedded-analytics). Use options for validityPeriod/permissions/criteria.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), options: advOpt },
+      annotations: { title: "Get embed URL", readOnlyHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, options }) => run(() => client.getEmbedUrl(workspace_id, view_id, options)),
+  );
+
+  server.registerTool(
+    "zoho_get_private_url",
+    {
+      description: "Get the existing private-link URL for a view (create one with zoho_create_private_url first).",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), options: advOpt },
+      annotations: { title: "Get private URL", ...READ_ONLY },
+    },
+    async ({ workspace_id, view_id, options }) => run(() => client.getPrivateUrl(workspace_id, view_id, options)),
+  );
+
+  writeTool(
+    "zoho_create_private_url",
+    {
+      description: "Create (or regenerate) a private-link URL for a view. Use options for permissions/password/expiryDate.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), options: advOpt },
+      annotations: { title: "Create private URL", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, options }) => run(() => client.createPrivateUrl(workspace_id, view_id, options)),
+  );
+
+  writeTool(
+    "zoho_remove_private_url",
+    {
+      description: "Remove the private-link access for a view.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id.") },
+      annotations: { title: "Remove private URL", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id }) => run(() => client.removePrivateUrl(workspace_id, view_id)),
+  );
+
+  writeTool(
+    "zoho_make_view_public",
+    {
+      description: "Make a view public and return its public URL. Use options for publicPermLevel/permissions/criteria.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), options: advOpt },
+      annotations: { title: "Make view public", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, options }) => {
+      audit("make_view_public", { workspace_id, view_id });
+      return run(() => client.makeViewPublic(workspace_id, view_id, options));
+    },
+  );
+
+  writeTool(
+    "zoho_remove_public",
+    {
+      description: "Remove public access from a view.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id.") },
+      annotations: { title: "Remove public access", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id }) => run(() => client.removePublic(workspace_id, view_id)),
+  );
+
+  server.registerTool(
+    "zoho_get_publish_config",
+    {
+      description: "Get a view's publish configuration (public/private/embed settings).",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id.") },
+      annotations: { title: "Get publish config", ...READ_ONLY },
+    },
+    async ({ workspace_id, view_id }) => run(() => client.getPublishConfig(workspace_id, view_id)),
+  );
+
+  writeTool(
+    "zoho_update_publish_config",
+    {
+      description: "Update a view's publish configuration. Pass the flags to change via options (e.g. includeTitle, includeToolBar, autoRefresh).",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), options: z.record(z.string(), z.unknown()).describe("Publish config keys to set.") },
+      annotations: { title: "Update publish config", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, options }) => run(() => client.updatePublishConfig(workspace_id, view_id, options)),
+  );
+
+  server.registerTool(
+    "zoho_list_slideshows",
+    {
+      description: "List the slideshows in a workspace.",
+      inputSchema: { workspace_id: ID("Workspace id.") },
+      annotations: { title: "List slideshows", ...READ_ONLY },
+    },
+    async ({ workspace_id }) => run(() => client.getSlideshows(workspace_id)),
+  );
+
+  writeTool(
+    "zoho_create_slideshow",
+    {
+      description: "Create a slideshow from a set of views. access_type: 0=with login, 1=without login, 2=sort.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        slide_name: z.string(),
+        view_ids: z.array(z.string()).min(1),
+        access_type: z.number().int().min(0).max(2).optional(),
+      },
+      annotations: { title: "Create slideshow", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, slide_name, view_ids, access_type }) =>
+      run(() => client.createSlideshow(workspace_id, { slideName: slide_name, viewIds: view_ids, ...(access_type != null ? { accessType: access_type } : {}) })),
+  );
+
+  writeTool(
+    "zoho_update_slideshow",
+    {
+      description: "Update a slideshow's name, views, or access type. Use options for regenerateSlideKey.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        slide_id: ID("Slideshow id."),
+        slide_name: z.string().optional(),
+        view_ids: z.array(z.string()).optional(),
+        access_type: z.number().int().min(0).max(2).optional(),
+        options: advOpt,
+      },
+      annotations: { title: "Update slideshow", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, slide_id, slide_name, view_ids, access_type, options }) =>
+      run(() =>
+        client.updateSlideshow(
+          workspace_id,
+          slide_id,
+          adv(
+            {
+              ...(slide_name ? { slideName: slide_name } : {}),
+              ...(view_ids ? { viewIds: view_ids } : {}),
+              ...(access_type != null ? { accessType: access_type } : {}),
+            },
+            options,
+          ),
+        ),
+      ),
+  );
+
+  writeTool(
+    "zoho_delete_slideshow",
+    {
+      description: "Delete a slideshow.",
+      inputSchema: { workspace_id: ID("Workspace id."), slide_id: ID("Slideshow id.") },
+      annotations: { title: "Delete slideshow", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, slide_id }) => run(() => client.deleteSlideshow(workspace_id, slide_id)),
+  );
+
+  server.registerTool(
+    "zoho_get_slideshow_url",
+    {
+      description: "Get the shareable URL for a slideshow. Use options for autoplay/slideInterval/title flags.",
+      inputSchema: { workspace_id: ID("Workspace id."), slide_id: ID("Slideshow id."), options: advOpt },
+      annotations: { title: "Get slideshow URL", readOnlyHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, slide_id, options }) => run(() => client.getSlideshowUrl(workspace_id, slide_id, options)),
+  );
+
+  // ============================ Variables ============================
+
+  server.registerTool(
+    "zoho_list_variables",
+    {
+      description: "List the variables defined in a workspace.",
+      inputSchema: { workspace_id: ID("Workspace id.") },
+      annotations: { title: "List variables", ...READ_ONLY },
+    },
+    async ({ workspace_id }) => run(() => client.getVariables(workspace_id)),
+  );
+
+  writeTool(
+    "zoho_create_variable",
+    {
+      description:
+        "Create a variable. variable_type: 0=LIST, 1=RANGE, 3=ALL_VALUES. variable_data_type: 1=PLAIN, 4=NUMBER, 5=POSITIVE_NUMBER, 6=DECIMAL_NUMBER, 7=CURRENCY, 8=PERCENT. Pass defaultData/userSpecificData/format via options.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        variable_name: z.string(),
+        variable_type: z.number().int().describe("0=LIST, 1=RANGE, 3=ALL_VALUES."),
+        variable_data_type: z.number().int().describe("1=PLAIN,4=NUMBER,5=POSITIVE_NUMBER,6=DECIMAL_NUMBER,7=CURRENCY,8=PERCENT."),
+        options: advOpt,
+      },
+      annotations: { title: "Create variable", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, variable_name, variable_type, variable_data_type, options }) =>
+      run(() =>
+        client.createVariable(
+          workspace_id,
+          adv({ variableName: variable_name, variableType: variable_type, variableDataType: variable_data_type }, options),
+        ),
+      ),
+  );
+
+  writeTool(
+    "zoho_update_variable",
+    {
+      description: "Update a variable's definition. Pass the fields to change via options (variableName, defaultData, etc.).",
+      inputSchema: { workspace_id: ID("Workspace id."), variable_id: ID("Variable id."), options: z.record(z.string(), z.unknown()).describe("Variable fields to set.") },
+      annotations: { title: "Update variable", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, variable_id, options }) => run(() => client.updateVariable(workspace_id, variable_id, options)),
+  );
+
+  writeTool(
+    "zoho_delete_variable",
+    {
+      description: "Delete a variable.",
+      inputSchema: { workspace_id: ID("Workspace id."), variable_id: ID("Variable id.") },
+      annotations: { title: "Delete variable", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, variable_id }) => run(() => client.deleteVariable(workspace_id, variable_id)),
+  );
 }

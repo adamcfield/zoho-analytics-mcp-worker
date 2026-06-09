@@ -2,7 +2,7 @@
 
 The [Zoho Analytics](https://www.zoho.com/analytics/) [API v2](https://www.zoho.com/analytics/api/v2/introduction.html) exposed as a **remote [MCP](https://modelcontextprotocol.io) server**, running as a **Cloudflare Worker** (Streamable HTTP + SSE). Built on the [`agents`](https://github.com/cloudflare/agents) `McpAgent`.
 
-It exposes **twenty tools** for the analytics workflow — discover organizations, workspaces and views; read column schemas; **run ad-hoc SQL queries**; export table data; add / update / delete rows; bulk-import CSV/JSON; and create tables & workspaces — plus conveniences the raw API lacks: a one-call **workspace schema map**, an end-to-end **SQL-query helper** that drives the async export job for you, bounded-concurrency batch reads, and bounded job polling. The tool definitions live in [`src/tools.ts`](src/tools.ts) and the Zoho Analytics REST client in [`src/zohoanalytics.ts`](src/zohoanalytics.ts); both are transport-agnostic, so every build shares an identical tool surface.
+It exposes **100+ tools spanning the full Zoho Analytics v2 API** — discovery & metadata, the Data API, the async Bulk API, modeling (tables, query tables, reports, columns, lookups, formulas, folders, view lifecycle), workspace administration, sharing & collaboration (groups, admins), user management, publishing & embedding (URLs, slideshows), and variables — plus conveniences the raw API lacks: a one-call **workspace schema map**, an end-to-end **SQL-query helper** that drives the async export job for you, bounded-concurrency batch reads, bounded job polling, and `dry_run` previews on destructive operations. The tool definitions live in [`src/tools.ts`](src/tools.ts) and the Zoho Analytics REST client in [`src/zohoanalytics.ts`](src/zohoanalytics.ts); both are transport-agnostic, so every build shares an identical tool surface. Set `MCP_READONLY=true` to register only the ~36 read tools.
 
 This repo ships **two deployments from the same code**:
 
@@ -142,7 +142,27 @@ When `MCP_READONLY=true`, none of these are registered — they never even appea
 | `zoho_create_table` | Create a table with a column design (typed columns) | `workspace_id`, `table_name`, `columns[]`, `description?`, `folder_name?`, `dry_run?` | write |
 | `zoho_delete_view` | **Permanently delete** a view/table | `workspace_id`, `view_id`, `dry_run?` | **destructive** |
 
-**Safety:** every mutating tool accepts `dry_run` (preview, change nothing). "Update/delete all rows" requires an explicit `update_all_rows`/`delete_all_rows` flag — an empty criteria is rejected. `truncateadd` imports warn that they replace all data. Write calls are **never** auto-retried.
+**Safety:** the destructive tools (delete row/column/folder/view/workspace, remove share/users, etc.) accept `dry_run` to preview without changing anything. "Update/delete all rows" requires an explicit `update_all_rows`/`delete_all_rows` flag — an empty criteria is rejected. `truncateadd` imports warn that they replace all data. Write calls are **never** auto-retried.
+
+### Modeling & schema (writes)
+
+Build and reshape data models. Query tables: `zoho_create_query_table`, `zoho_edit_query_table`. Reports: `zoho_create_report`, `zoho_update_report`. Columns: `zoho_add_column`, `zoho_rename_column`, `zoho_delete_column`, `zoho_hide_columns`, `zoho_show_columns`, `zoho_reorder_columns`, `zoho_add_lookup`, `zoho_remove_lookup`. Formulas: `zoho_add_formula_column`, `zoho_delete_formula_column`, `zoho_add_aggregate_formula`, `zoho_delete_aggregate_formula`. Folders: `zoho_create_folder`, `zoho_rename_folder`, `zoho_delete_folder`. View lifecycle: `zoho_rename_view`, `zoho_save_as_view`, `zoho_move_views_to_folder`, `zoho_sort_data`, `zoho_create_table_from_data`, and trash ops `zoho_get_trash` · `zoho_restore_view` · `zoho_delete_trash_view`. Workspace admin: `zoho_rename_workspace`, `zoho_delete_workspace`, `zoho_copy_workspace`, `zoho_copy_views`, `zoho_get_workspace_secret_key`. Plus reads `zoho_list_folders`, `zoho_get_view_metadata`, `zoho_list_dashboards`, `zoho_list_recent_views`, `zoho_list_datasources`.
+
+### Sharing & collaboration
+
+`zoho_share_views`, `zoho_update_shared_views`, `zoho_remove_share`, `zoho_get_shared_details`, `zoho_get_my_permissions`. Groups: `zoho_list_groups`, `zoho_create_group`, `zoho_delete_group`, `zoho_add_group_members`, `zoho_remove_group_members`. Admins: `zoho_get_workspace_admins`, `zoho_add_workspace_admins`, `zoho_remove_workspace_admins`, `zoho_get_org_admins`. Permissions are a boolean map (`read` required; also `export`, `vud`, `addRow`, `drillDown`, `share`, …).
+
+### User management
+
+Org: `zoho_list_users`, `zoho_add_users`, `zoho_remove_users`, `zoho_set_users_status`, `zoho_change_user_role` (USER/VIEWER/ORGADMIN), plus `zoho_get_subscription` and `zoho_get_resources`. Workspace: `zoho_list_workspace_users`, `zoho_add_workspace_users`, `zoho_remove_workspace_users`, `zoho_change_workspace_user_status`, `zoho_change_workspace_user_role` (USER/WORKSPACEADMIN/custom).
+
+### Publishing & embedding
+
+`zoho_get_view_url`, `zoho_get_embed_url`, `zoho_get_private_url`, `zoho_create_private_url`, `zoho_remove_private_url`, `zoho_make_view_public`, `zoho_remove_public`, `zoho_get_publish_config`, `zoho_update_publish_config`. Slideshows: `zoho_list_slideshows`, `zoho_create_slideshow`, `zoho_update_slideshow`, `zoho_delete_slideshow`, `zoho_get_slideshow_url`.
+
+### Variables
+
+`zoho_list_variables`, `zoho_create_variable`, `zoho_update_variable`, `zoho_delete_variable`.
 
 ### Operational modes
 
@@ -177,7 +197,9 @@ The tools map onto these Zoho Analytics v2 endpoints (relative to `https://<api-
 | `zoho_create_table` | `POST /workspaces/{workspace-id}/tables` |
 | `zoho_delete_view` | `DELETE /workspaces/{workspace-id}/views/{view-id}` |
 
-**Not yet exposed** (present in the API, intentionally omitted): create query table / report / column / folder, workspace copy/rename/share, user-management and embed APIs. To add one, add a method to `ZohoAnalyticsClient` and a tool in `registerTools()`. Full API: <https://www.zoho.com/analytics/api/v2/introduction.html>.
+The table above lists the core data/metadata endpoints; **v1.1 adds the rest of the v2 surface** — modeling (`/querytables`, `/reports`, `/views/{id}/columns`, `/customformulas`, `/aggregateformulas`, `/folders`, `/views/{id}/saveas`, `/trash/{id}`, …), workspace admin (`/secretkey`, copy/rename/delete, `/views/copy`), sharing (`/views/share`, `/groups`, `/admins`, `/orgadmins`), user management (`/users`, `/users/role`, `/subscription`, `/resources`, `/workspaces/{id}/users`), publishing/embed (`/publish`, `/publish/embed`, `/publish/privatelink`, `/publish/public`, `/slides`), and `/variables` — see the matching tool categories above and the `ZohoAnalyticsClient` methods in [`src/zohoanalytics.ts`](src/zohoanalytics.ts).
+
+**Still intentionally omitted:** the **AutoML** APIs (predictive analysis / model deployment — a large separate subsystem) and **email-schedule** management. To add either, add a method to `ZohoAnalyticsClient` and a tool in `registerTools()`. Full API: <https://www.zoho.com/analytics/api/v2/introduction.html> · specs: <https://github.com/zoho/analytics-oas>.
 
 ---
 
@@ -374,7 +396,9 @@ npx wrangler deploy -c wrangler.oauth.jsonc
 - **Bring your own OAuth app.** You need a registered Zoho client and a refresh token (see [Getting Zoho OAuth credentials](#getting-zoho-oauth-credentials)). `ZOHO_DC` must match the data center your account lives in, or token refresh fails.
 - **Ad-hoc SQL is async.** Zoho runs ad-hoc SQL through a bulk export *job*. `zoho_query_data` hides this (create → poll → download) but bounds its wait (default 30s, cap 60s); for very large result sets it returns a `job_id` to poll with `zoho_get_export_job`.
 - **API units & frequency limits.** Calls consume daily API units and are subject to per-minute frequency limits (≈100 req/min overall). Batch tools use bounded concurrency, but heavy use can still hit quota errors (`6043`/`6044`/`6045`).
+- **Large tool surface.** Full coverage means ~101 tools. That's a lot for one connector — if your client struggles with the count or you only need reporting, deploy with `MCP_READONLY=true` for the ~36 read tools. Advanced/long-tail CONFIG keys on the modeling, sharing, publish, and variable tools are passed through an `options` object (documented per tool) rather than enumerated as parameters.
 - **Single-user OAuth.** The OAuth worker gates on one shared passphrase — fine for a personal connector, not multi-tenant. Swap the consent handler for a real IdP if you need per-user identity.
+- **Spec ambiguities.** A handful of Zoho endpoints are inconsistent across their docs/OpenAPI specs/SDK (e.g. the data-sync path's singular vs. plural segment, `get_my_permissions` path, secret-key `regenerateKey`). These were implemented to the OpenAPI specs; verify the niche ones against a live call. AutoML and email-schedule APIs are not exposed.
 - **Dependency versions.** `agents@^0.14.5` + `@modelcontextprotocol/sdk@^1.29.0` + `zod@^4`; `npm audit` is clean. `ai`/`react` are required peers of `agents` but are never imported into the Worker bundle.
 
 ---
@@ -385,7 +409,7 @@ npx wrangler deploy -c wrangler.oauth.jsonc
 src/
   index.ts          Bearer worker entry — routing, bearer gate, McpAgent/Durable Object, clientFromEnv
   oauth.ts          OAuth worker entry — OAuthProvider + passphrase consent + McpAgent
-  tools.ts          registerTools() — the 20 tool definitions + Zod schemas + helpers (shared)
+  tools.ts          registerTools() — 100+ tool definitions + Zod schemas + helpers (shared)
   zohoanalytics.ts  ZohoAnalyticsClient — dependency-free REST client (fetch-only): OAuth refresh,
                     CONFIG-param + envelope handling, DC routing, retry/backoff, mapLimit (shared)
   ai-stub.ts        stubs the unused `ai` peer dep out of the bundle

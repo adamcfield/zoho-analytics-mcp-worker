@@ -67,7 +67,7 @@ export function clientFromEnv(env: Env): ZohoAnalyticsClient {
 }
 
 export class ZohoAnalyticsMCP extends McpAgent<Env> {
-  server = new McpServer({ name: "zoho-analytics", version: "1.0.0" });
+  server = new McpServer({ name: "zoho-analytics", version: "1.1.0" });
 
   async init(): Promise<void> {
     registerTools(this.server, clientFromEnv(this.env), {

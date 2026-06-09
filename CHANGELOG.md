@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.1.0 — Full API coverage
+
+### Added
+- Expanded from 20 to **~101 tools**, covering the full Zoho Analytics v2 surface:
+  - **Modeling:** query tables (`create`/`edit`), reports (`create`/`update`), columns
+    (`add`/`rename`/`delete`/`hide`/`show`/`reorder`/`lookup`), inline & aggregate formulas,
+    folders (`create`/`rename`/`delete`), view lifecycle (`rename`/`save_as`/`move`/`sort`,
+    trash `list`/`restore`/`delete`), `create_table_from_data`.
+  - **Workspace admin:** `rename`/`delete`/`copy` workspace, `copy_views`, `get_workspace_secret_key`
+    (incl. cross-org via `ZANALYTICS-DEST-ORGID`).
+  - **Sharing:** share/update/remove view shares, shared-details, my-permissions, groups CRUD +
+    members, workspace & org admins.
+  - **User management:** org users (add/remove/status/role, subscription, resources) and
+    workspace users (add/remove/status/role).
+  - **Publishing & embed:** view/embed/private URLs, make-public, publish config, slideshows CRUD.
+  - **Variables:** list/create/update/delete.
+  - **Reads:** folders, dashboards, recent views, view metadata, datasources, trash.
+
+### Changed
+- **Transport fix:** write calls (POST/PUT/DELETE) now send `CONFIG` as an
+  `application/x-www-form-urlencoded` body (matching Zoho's documented `--data-urlencode`),
+  while GET and multipart import keep `CONFIG` in the query string. Empty `204 No Content`
+  responses are surfaced as `{status:"success"}`. Added support for cross-org `ZANALYTICS-DEST-ORGID`
+  headers and a raw-JSON-body path (sort).
+- Tool count check in `npm run smoke` raised; new transport unit tests (CONFIG-in-body, 204,
+  cross-org header, multipart) added — **36 tests** total, typecheck clean, both workers bundle clean.
+
+### Notes
+- AutoML and email-schedule APIs remain intentionally unexposed.
+- Advanced/long-tail CONFIG keys on modeling/sharing/publish/variable tools are passed through an
+  `options` object rather than enumerated as parameters.
+
 ## 1.0.0 — Initial release
 
 The Zoho Analytics API v2 exposed as a remote MCP server on Cloudflare Workers,

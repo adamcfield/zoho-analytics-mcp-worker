@@ -100,6 +100,39 @@ describe("CONFIG + headers", () => {
   });
 });
 
+describe("write transport (CONFIG placement)", () => {
+  it("sends CONFIG in the form body (not the query) for writes", async () => {
+    const f = vi.fn(async () => new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 }));
+    vi.stubGlobal("fetch", f);
+    await mkStatic().addRow("WS", "V", { columns: { a: 1 } });
+    const [url, init] = f.mock.calls[0] as [string, RequestInit];
+    expect(url).not.toContain("CONFIG=");
+    expect((init.headers as Record<string, string>)["Content-Type"]).toBe("application/x-www-form-urlencoded");
+    expect(decodeURIComponent(String(init.body))).toContain('"columns":{"a":1}');
+  });
+
+  it("treats an empty 204 response as success", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 204 })));
+    expect(await mkStatic().deleteView("WS", "V")).toEqual({ status: "success" });
+  });
+
+  it("adds the ZANALYTICS-DEST-ORGID header for cross-org copies", async () => {
+    const f = vi.fn(async () => new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 }));
+    vi.stubGlobal("fetch", f);
+    await mkStatic().copyViews("WS", { viewIds: ["v"], destWorkspaceId: "W2" }, "ORG2");
+    expect((f.mock.calls[0][1] as RequestInit).headers).toMatchObject({ "ZANALYTICS-DEST-ORGID": "ORG2" });
+  });
+
+  it("keeps CONFIG in the query string and sends FormData for multipart import", async () => {
+    const f = vi.fn(async () => new Response(JSON.stringify({ status: "success", data: { jobId: "1" } }), { status: 200 }));
+    vi.stubGlobal("fetch", f);
+    await mkStatic().createImportJob("WS", "V", { content: "a,b\n1,2", name: "import.csv" }, { importType: "append", fileType: "csv" });
+    const [url, init] = f.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain("CONFIG=");
+    expect(init.body instanceof FormData).toBe(true);
+  });
+});
+
 describe("requestRaw (export / download)", () => {
   it("returns the raw body for a successful export", async () => {
     vi.stubGlobal("fetch", mockSequence([{ status: 200, body: "Region,Sales\nEast,100" }]));
