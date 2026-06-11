@@ -234,6 +234,7 @@ Set via `npx wrangler secret put <NAME>` (secrets) or a `[vars]` block (non-secr
 | `APP_PASSPHRASE` | oauth | ✅ | Passphrase entered on the OAuth consent screen |
 | `OAUTH_KV` (binding) | oauth | ✅ | KV namespace storing OAuth grants/registrations |
 | `ZOHO_DC` | both | optional | Data center: `com` (default) `eu in au jp sa ca uk cn` |
+| `TOKEN_KV` (binding) | bearer | recommended | KV namespace sharing ONE Zoho access token across all sessions (the OAuth worker reuses `OAUTH_KV` for this automatically). Without it, every new MCP session mints its own token — Zoho caps token creation at ~10 per 10 min per refresh token, so >10 new sessions in 10 minutes will start failing auth. `npx wrangler kv namespace create TOKEN_KV`, then uncomment the block in [wrangler.jsonc](wrangler.jsonc). |
 | `ZOHO_ACCESS_TOKEN` | both | optional | Static access token (expires hourly; testing only — skips refresh) |
 | `ZOHO_ANALYTICS_BASE_URL` | both | optional | Override the API host |
 | `ZOHO_ACCOUNTS_BASE_URL` | both | optional | Override the accounts/OAuth host |
@@ -415,7 +416,8 @@ npx wrangler deploy -c wrangler.oauth.jsonc
 - **API units & frequency limits.** Calls consume daily API units and are subject to per-minute frequency limits (≈100 req/min overall). Batch tools use bounded concurrency, but heavy use can still hit quota errors (`6043`/`6044`/`6045`).
 - **Large tool surface.** Full coverage means ~140 tools. That's a lot for one connector — if your client struggles with the count or you only need reporting, deploy with `MCP_READONLY=true` for the ~48 read tools. Advanced/long-tail CONFIG keys on the modeling, sharing, publish, and variable tools are passed through an `options` object (documented per tool) rather than enumerated as parameters.
 - **Single-user OAuth.** The OAuth worker gates on one shared passphrase — fine for a personal connector, not multi-tenant. Swap the consent handler for a real IdP if you need per-user identity.
-- **Spec ambiguities.** A handful of Zoho endpoints are inconsistent across their docs/OpenAPI specs/SDK (e.g. the data-sync path's singular vs. plural segment, `get_my_permissions` path, secret-key `regenerateKey`). These were implemented to the OpenAPI specs; verify the niche ones against a live call.
+- **Spec ambiguities.** A handful of Zoho endpoints are inconsistent between their OpenAPI specs and their live API docs/SDK. Where they conflict, this client follows the **live docs + SDK** (email-schedule writes are workspace-scoped with no `/trigger` suffix; datasource paths use plural `datasources`) — the OAS disagrees on those. Remaining unverified niche path: `get_my_permissions` (`mypermissions` per OAS vs `userpermissions` per SDK). Verify niche endpoints with a live call.
+- **Memory bounds.** Sync exports/downloads are refused above ~10MB (use the async CSV export and page it), imports above ~25MB (split the file), and template ZIPs above ~256KB (export fewer views) — Durable Objects have a 128MB memory ceiling and tool results land in an LLM context.
 - **Dependency versions.** `agents@^0.14.5` + `@modelcontextprotocol/sdk@^1.29.0` + `zod@^4`; `npm audit` is clean. `ai`/`react` are required peers of `agents` (npm auto-installs them) but nothing on the `agents/mcp` server path imports them, so they never enter the Worker bundle.
 
 ---

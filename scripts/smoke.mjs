@@ -7,10 +7,10 @@
  *   MCP_TOKEN=<bearer> \
  *   node scripts/smoke.mjs
  *
- * Checks: initialize handshake, tools/list (>= 90 tools on a full deploy;
- * read-only deploys are auto-detected and write-tool checks skipped), and
- * zoho_whoami (which validates the Zoho OAuth credentials end-to-end).
- * Exits non-zero if any check fails.
+ * Checks: initialize handshake, tools/list (>= 130 tools on a full deploy,
+ * >= 40 on read-only deploys, which are auto-detected so write-tool checks
+ * are skipped), and zoho_whoami (which validates the Zoho OAuth credentials
+ * end-to-end). Exits non-zero if any check fails.
  */
 const URL = process.env.MCP_URL;
 const TOKEN = process.env.MCP_TOKEN;

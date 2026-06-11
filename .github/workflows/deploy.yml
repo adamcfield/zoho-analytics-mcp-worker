@@ -1,0 +1,46 @@
+# Gated deploy: runs typecheck + tests, deploys the selected worker, then smoke-
+# tests the live deployment. Trigger manually from the Actions tab.
+#
+# Required repo secrets:
+#   CLOUDFLARE_API_TOKEN   API token with Workers deploy permission
+#   MCP_AUTH_TOKEN         (optional) bearer for the post-deploy smoke test
+#   MCP_URL                (optional) deployed /mcp URL for the smoke test
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker:
+        description: "Which worker to deploy"
+        type: choice
+        options: [bearer, oauth]
+        default: bearer
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          command: deploy ${{ inputs.worker == 'oauth' && '-c wrangler.oauth.jsonc' || '' }}
+      - name: Smoke test (skipped unless MCP_URL + MCP_AUTH_TOKEN secrets are set)
+        if: ${{ inputs.worker == 'bearer' }}
+        env:
+          MCP_URL: ${{ secrets.MCP_URL }}
+          MCP_TOKEN: ${{ secrets.MCP_AUTH_TOKEN }}
+        run: |
+          if [ -n "$MCP_URL" ] && [ -n "$MCP_TOKEN" ]; then
+            node scripts/smoke.mjs
+          else
+            echo "MCP_URL / MCP_AUTH_TOKEN secrets not set — skipping live smoke test."
+          fi

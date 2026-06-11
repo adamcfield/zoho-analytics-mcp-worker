@@ -73,6 +73,49 @@ export class ZohoAnalyticsError extends Error {
 
 export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+/** Encode a caller-supplied id before it is interpolated into an API path. */
+const enc = encodeURIComponent;
+
+/**
+ * Cross-instance access-token cache. Each MCP session runs in its own Durable
+ * Object with its own client, so without a shared store every new session mints
+ * its own access token — and Zoho caps token creation (~10 per 10 min per
+ * refresh token). Back this with Workers KV to share one token across sessions.
+ */
+export interface TokenStore {
+  get(): Promise<{ token: string; expiry: number } | null>;
+  set(token: string, expiry: number): Promise<void>;
+}
+
+/** TokenStore backed by a Workers KV namespace (structurally typed; pass any KV binding). */
+export function kvTokenStore(kv: {
+  get(key: string, type: "json"): Promise<unknown>;
+  put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>;
+}): TokenStore {
+  const KEY = "zoho-analytics:access-token";
+  return {
+    async get() {
+      try {
+        const v = (await kv.get(KEY, "json")) as { token?: unknown; expiry?: unknown } | null;
+        if (v && typeof v.token === "string" && typeof v.expiry === "number") {
+          return { token: v.token, expiry: v.expiry };
+        }
+      } catch {
+        /* a broken KV read must never block auth — fall back to a fresh mint */
+      }
+      return null;
+    },
+    async set(token, expiry) {
+      try {
+        const ttl = Math.max(60, Math.floor((expiry - Date.now()) / 1000) - 60);
+        await kv.put(KEY, JSON.stringify({ token, expiry }), { expirationTtl: ttl });
+      } catch {
+        /* best-effort */
+      }
+    },
+  };
+}
+
 /**
  * Run an async fn over `items` with bounded concurrency, preserving input order.
  * Used by batch tools (e.g. describe-workspace) so we never open hundreds of
@@ -128,6 +171,8 @@ export interface ZohoAnalyticsClientOptions {
   timeoutMs?: number;
   /** Base for exponential backoff (ms). Default 1000. Lower it in tests for speed. */
   backoffBaseMs?: number;
+  /** Optional cross-instance access-token cache (see kvTokenStore). */
+  tokenStore?: TokenStore;
 }
 
 interface CoreOptions {
@@ -171,6 +216,8 @@ export class ZohoAnalyticsClient {
   private accessTokenExpiry = 0;
   // In-flight refresh shared by concurrent callers (single-flight).
   private refreshPromise?: Promise<string>;
+  // Optional cross-instance token cache (KV) shared by all sessions.
+  private tokenStore?: TokenStore;
 
   constructor(opts: ZohoAnalyticsClientOptions) {
     const hasRefresh = !!(opts.refreshToken && opts.clientId && opts.clientSecret);
@@ -200,6 +247,7 @@ export class ZohoAnalyticsClient {
     this.maxRetries = opts.maxRetries ?? 3;
     this.timeoutMs = opts.timeoutMs ?? 30000;
     this.backoffBaseMs = opts.backoffBaseMs ?? 1000;
+    this.tokenStore = opts.tokenStore;
   }
 
   // ---- OAuth token management ----
@@ -213,10 +261,27 @@ export class ZohoAnalyticsClient {
     // Single-flight: concurrent callers (e.g. a mapLimit batch on a cold isolate)
     // share one refresh instead of stampeding the token endpoint — Zoho rate-limits
     // access-token creation per refresh token (~10 per 10 minutes).
-    this.refreshPromise ??= this.refreshAccessToken().finally(() => {
+    this.refreshPromise ??= this.acquireAccessToken().finally(() => {
       this.refreshPromise = undefined;
     });
     return this.refreshPromise;
+  }
+
+  /** Check the shared cross-instance store first; only mint a new token on a miss. */
+  private async acquireAccessToken(): Promise<string> {
+    if (this.tokenStore) {
+      const stored = await this.tokenStore.get();
+      if (stored && Date.now() < stored.expiry - 60_000) {
+        this.accessToken = stored.token;
+        this.accessTokenExpiry = stored.expiry;
+        return stored.token;
+      }
+    }
+    const token = await this.refreshAccessToken();
+    if (this.tokenStore) {
+      await this.tokenStore.set(token, this.accessTokenExpiry);
+    }
+    return token;
   }
 
   /** Exchange the refresh token for a fresh access token at the accounts endpoint. */
@@ -224,20 +289,27 @@ export class ZohoAnalyticsClient {
     if (!this.refreshToken || !this.clientId || !this.clientSecret) {
       throw new Error("Cannot refresh: missing refreshToken/clientId/clientSecret.");
     }
+    // Credentials travel in the POST body, never the URL — query strings are
+    // routinely captured by access logs, proxies, and TLS-inspection middleboxes.
     const params = new URLSearchParams({
       refresh_token: this.refreshToken,
       client_id: this.clientId,
       client_secret: this.clientSecret,
       grant_type: "refresh_token",
     });
-    const url = `${this.accountsOrigin}/oauth/v2/token?${params.toString()}`;
+    const url = `${this.accountsOrigin}/oauth/v2/token`;
 
     let lastErr = "";
     for (let attempt = 0; attempt <= 2; attempt++) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), this.timeoutMs);
       try {
-        const res = await fetch(url, { method: "POST", signal: controller.signal });
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: params.toString(),
+          signal: controller.signal,
+        });
         clearTimeout(timer);
         const text = await res.text();
         let data: Record<string, unknown> = {};
@@ -282,7 +354,9 @@ export class ZohoAnalyticsClient {
     let delayMs: number;
     const secs = retryAfter ? Number(retryAfter) : NaN;
     if (Number.isFinite(secs)) {
-      delayMs = secs * 1000;
+      // Cap server-provided Retry-After so a 429 inside a polling tool call
+      // can't sleep past the caller's deadline / the MCP client's timeout.
+      delayMs = Math.min(secs * 1000, 8000);
     } else {
       delayMs = Math.min(this.backoffBaseMs * 2 ** attempt, 8000);
     }
@@ -343,9 +417,16 @@ export class ZohoAnalyticsClient {
         const res = await fetch(url, { method, headers, body, signal: controller.signal });
         clearTimeout(timer);
         // Binary reads only apply to OK responses; error bodies stay text so the
-        // failure envelope can be parsed. (A failure envelope on HTTP 200 would be
-        // base64'd and missed — acceptable for the one binary endpoint, template export.)
-        const text = opts.binary && res.ok ? b64encode(await res.arrayBuffer()) : await res.text();
+        // failure envelope can be parsed. A body starting with "{" is a JSON
+        // envelope (Zoho reports some failures with HTTP 200), never a ZIP — decode
+        // it as text so requestRaw's failure detection still fires.
+        let text: string;
+        if (opts.binary && res.ok) {
+          const buf = await res.arrayBuffer();
+          text = new Uint8Array(buf)[0] === 0x7b ? new TextDecoder().decode(buf) : b64encode(buf);
+        } else {
+          text = await res.text();
+        }
 
         // The token may have been revoked/expired server-side before our cached
         // expiry. Refresh once and retry immediately.
@@ -435,15 +516,15 @@ export class ZohoAnalyticsClient {
     return this.request("GET", "/workspaces/shared");
   }
   getWorkspaceDetails(workspaceId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}`);
   }
   /** Views in a workspace. config: { viewTypes?: number[], keyword?, startIndex?, noOfResult? }. */
   getViews(workspaceId: string, config?: Config) {
-    return this.request("GET", `/workspaces/${workspaceId}/views`, { config });
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/views`, { config });
   }
   /** View details (note: org-level path). config: { withInvolvedMetaInfo?: true } adds column metadata. */
   getViewDetails(viewId: string, config?: Config) {
-    return this.request("GET", `/views/${viewId}`, { config });
+    return this.request("GET", `/views/${enc(viewId)}`, { config });
   }
   /** Workspace/view + column metadata looked up by NAME. config: { workspaceName, viewName? }. */
   getMetaDetails(workspaceName: string, viewName?: string) {
@@ -453,13 +534,13 @@ export class ZohoAnalyticsClient {
   }
   /** Table metadata (columns) for a view. */
   getViewMetadata(workspaceId: string, viewId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/views/${viewId}/metadata`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/metadata`);
   }
   getQueryTableDetails(workspaceId: string, queryTableId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/querytables/${queryTableId}`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/querytables/${enc(queryTableId)}`);
   }
   getFolders(workspaceId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/folders`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/folders`);
   }
   getDashboards() {
     return this.request("GET", "/dashboards");
@@ -468,10 +549,10 @@ export class ZohoAnalyticsClient {
     return this.request("GET", "/recentviews");
   }
   getTrashViews(workspaceId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/trash`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/trash`);
   }
   getDatasources(workspaceId: string, viewId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/views/${viewId}/datasources`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/datasources`);
   }
 
   // ============================ Data API (synchronous) ============================
@@ -482,44 +563,44 @@ export class ZohoAnalyticsClient {
    * Dashboard/Query-Table views — use the bulk export job for those.
    */
   exportData(workspaceId: string, viewId: string, config: Config): Promise<string> {
-    return this.requestRaw("GET", `/workspaces/${workspaceId}/views/${viewId}/data`, { config });
+    return this.requestRaw("GET", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/data`, { config });
   }
   /** Add a single row. config: { columns: { name: value, ... }, dateFormat? }. */
   addRow(workspaceId: string, viewId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/rows`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/rows`, { config });
   }
   /** Update rows. config: { columns, criteria?, updateAllRows?, addIfNotExist? }. */
   updateRows(workspaceId: string, viewId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/views/${viewId}/rows`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/rows`, { config });
   }
   /** Delete rows. config: { criteria } or { deleteAllRows: true }. */
   deleteRows(workspaceId: string, viewId: string, config: Config) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/views/${viewId}/rows`, { config });
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/rows`, { config });
   }
   /** Sort a view's data. Takes a raw JSON body: { columns, sortOrder (1=asc,2=desc), resetSort? }. */
   sortData(workspaceId: string, viewId: string, body: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/views/${viewId}/data/sort`, { jsonBody: body });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/data/sort`, { jsonBody: body });
   }
 
   // ============================ Bulk API (asynchronous) ============================
 
   /** Create an export job from a SQL query. Returns envelope with data.jobId. */
   createExportJobBySql(workspaceId: string, sqlQuery: string, responseFormat: ResponseFormat = "json") {
-    return this.request("GET", `/bulk/workspaces/${workspaceId}/data`, {
+    return this.request("GET", `/bulk/workspaces/${enc(workspaceId)}/data`, {
       config: { responseFormat, sqlQuery },
     });
   }
   /** Create an export job for an entire view. config: { responseFormat (required), criteria?, ... }. */
   createExportJobByView(workspaceId: string, viewId: string, config: Config) {
-    return this.request("GET", `/bulk/workspaces/${workspaceId}/views/${viewId}/data`, { config });
+    return this.request("GET", `/bulk/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/data`, { config });
   }
   /** Poll an export job. Returns envelope with data.jobCode/jobStatus/downloadUrl. */
   getExportJobStatus(workspaceId: string, jobId: string) {
-    return this.request("GET", `/bulk/workspaces/${workspaceId}/exportjobs/${jobId}`);
+    return this.request("GET", `/bulk/workspaces/${enc(workspaceId)}/exportjobs/${enc(jobId)}`);
   }
   /** Download a completed export job's data (raw body). */
   downloadExportData(workspaceId: string, jobId: string): Promise<string> {
-    return this.requestRaw("GET", `/bulk/workspaces/${workspaceId}/exportjobs/${jobId}/data`);
+    return this.requestRaw("GET", `/bulk/workspaces/${enc(workspaceId)}/exportjobs/${enc(jobId)}/data`);
   }
   /**
    * Create a bulk import job. The file rides as a multipart field named FILE.
@@ -533,7 +614,7 @@ export class ZohoAnalyticsClient {
   ) {
     const form = new FormData();
     form.append("FILE", new Blob([file.content], { type: file.type ?? "text/csv" }), file.name);
-    return this.request("POST", `/bulk/workspaces/${workspaceId}/views/${viewId}/data`, { config, form });
+    return this.request("POST", `/bulk/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/data`, { config, form });
   }
   /** Create an import job that also CREATES a new table from the uploaded data. config: { tableName, fileType, autoIdentify, ... }. */
   createTableFromData(
@@ -543,11 +624,11 @@ export class ZohoAnalyticsClient {
   ) {
     const form = new FormData();
     form.append("FILE", new Blob([file.content], { type: file.type ?? "text/csv" }), file.name);
-    return this.request("POST", `/bulk/workspaces/${workspaceId}/data`, { config, form });
+    return this.request("POST", `/bulk/workspaces/${enc(workspaceId)}/data`, { config, form });
   }
   /** Poll an import job. Returns envelope with data.jobCode/jobStatus/jobInfo.importSummary. */
   getImportJobStatus(workspaceId: string, jobId: string) {
-    return this.request("GET", `/bulk/workspaces/${workspaceId}/importjobs/${jobId}`);
+    return this.request("GET", `/bulk/workspaces/${enc(workspaceId)}/importjobs/${enc(jobId)}`);
   }
 
   // ============================ Modeling: workspaces ============================
@@ -558,26 +639,26 @@ export class ZohoAnalyticsClient {
     return this.request("POST", "/workspaces", { config });
   }
   renameWorkspace(workspaceId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}`, { config });
   }
   /** Permanently delete a workspace (workspaces are not trashed). Irreversible. */
   deleteWorkspace(workspaceId: string) {
-    return this.request("DELETE", `/workspaces/${workspaceId}`);
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}`);
   }
   /** Copy a workspace. config: { newWorkspaceName, newWorkspaceDesc?, workspaceKey?, copyWithData? }. destOrgId for cross-org. */
   copyWorkspace(workspaceId: string, config: Config, destOrgId?: string) {
-    return this.request("POST", `/workspaces/${workspaceId}`, {
+    return this.request("POST", `/workspaces/${enc(workspaceId)}`, {
       config,
       headers: destOrgId ? { "ZANALYTICS-DEST-ORGID": destOrgId } : undefined,
     });
   }
   /** Get (or regenerate, with config { regenerateKey: true }) the workspace secret key for cross-org copies. */
   getWorkspaceSecretKey(workspaceId: string, config?: Config) {
-    return this.request("GET", `/workspaces/${workspaceId}/secretkey`, { config });
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/secretkey`, { config });
   }
   /** Copy views to another workspace/org. config: { viewIds, destWorkspaceId, workspaceKey?, copyWithData? }. destOrgId required. */
   copyViews(workspaceId: string, config: Config, destOrgId: string) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/copy`, {
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/views/copy`, {
       config,
       headers: { "ZANALYTICS-DEST-ORGID": destOrgId },
     });
@@ -587,168 +668,168 @@ export class ZohoAnalyticsClient {
 
   /** Create a table. config: { tableDesign: { TABLENAME, COLUMNS: [...] } }. */
   createTable(workspaceId: string, tableDesign: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/tables`, { config: { tableDesign } });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/tables`, { config: { tableDesign } });
   }
   /** Create a query (SQL-backed) table. config: { sqlQuery, queryTableName, description?, folderId? }. */
   createQueryTable(workspaceId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/querytables`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/querytables`, { config });
   }
   /** Edit a query table. config: { sqlQuery, folderId? }. */
   editQueryTable(workspaceId: string, queryTableId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/querytables/${queryTableId}`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/querytables/${enc(queryTableId)}`, { config });
   }
   /** Create a report (chart/pivot/summary). config: { baseTableName, title, reportType, chartType?, axisColumns[], ... }. */
   createReport(workspaceId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/reports`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/reports`, { config });
   }
   updateReport(workspaceId: string, reportId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/reports/${reportId}`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/reports/${enc(reportId)}`, { config });
   }
 
   // ============================ Modeling: columns ============================
 
   /** Add a column. config: { columnName, dataType, isPIIColumn?, geoRole? }. */
   addColumn(workspaceId: string, viewId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/columns`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/columns`, { config });
   }
   renameColumn(workspaceId: string, viewId: string, columnId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/views/${viewId}/columns/${columnId}`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/columns/${enc(columnId)}`, { config });
   }
   deleteColumn(workspaceId: string, viewId: string, columnId: string, config?: Config) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/views/${viewId}/columns/${columnId}`, { config });
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/columns/${enc(columnId)}`, { config });
   }
   /** Hide columns. config: { columnIds: [...] }. */
   hideColumns(workspaceId: string, viewId: string, columnIds: string[]) {
-    return this.request("PUT", `/workspaces/${workspaceId}/views/${viewId}/columns/hide`, { config: { columnIds } });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/columns/hide`, { config: { columnIds } });
   }
   showColumns(workspaceId: string, viewId: string, columnIds: string[]) {
-    return this.request("PUT", `/workspaces/${workspaceId}/views/${viewId}/columns/show`, { config: { columnIds } });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/columns/show`, { config: { columnIds } });
   }
   /** Reorder columns. `columns` must list ALL column ids in the desired order. */
   reorderColumns(workspaceId: string, viewId: string, columns: string[]) {
-    return this.request("PUT", `/workspaces/${workspaceId}/views/${viewId}/columns/reorder`, { config: { columns } });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/columns/reorder`, { config: { columns } });
   }
   /** Add a lookup. config: { referenceViewId, referenceColumnId }. */
   addLookup(workspaceId: string, viewId: string, columnId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/columns/${columnId}/lookup`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/columns/${enc(columnId)}/lookup`, { config });
   }
   removeLookup(workspaceId: string, viewId: string, columnId: string, config?: Config) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/views/${viewId}/columns/${columnId}/lookup`, { config });
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/columns/${enc(columnId)}/lookup`, { config });
   }
 
   // ============================ Modeling: formulas ============================
 
   /** Add an inline/custom formula column. config: { formulaName, expression, description? }. */
   addFormulaColumn(workspaceId: string, viewId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/customformulas`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/customformulas`, { config });
   }
   deleteFormulaColumn(workspaceId: string, viewId: string, formulaId: string, config?: Config) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/views/${viewId}/customformulas/${formulaId}`, { config });
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/customformulas/${enc(formulaId)}`, { config });
   }
   /** Add an aggregate formula. config: { formulaName, expression, description? }. */
   addAggregateFormula(workspaceId: string, viewId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/aggregateformulas`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/aggregateformulas`, { config });
   }
   deleteAggregateFormula(workspaceId: string, viewId: string, formulaId: string, config?: Config) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/views/${viewId}/aggregateformulas/${formulaId}`, { config });
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/aggregateformulas/${enc(formulaId)}`, { config });
   }
 
   // ============================ Modeling: folders ============================
 
   /** config: { folderName, folderDesc?, parentFolderId?, makeDefaultFolder? }. */
   createFolder(workspaceId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/folders`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/folders`, { config });
   }
   renameFolder(workspaceId: string, folderId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/folders/${folderId}`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/folders/${enc(folderId)}`, { config });
   }
   deleteFolder(workspaceId: string, folderId: string, config?: Config) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/folders/${folderId}`, { config });
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/folders/${enc(folderId)}`, { config });
   }
 
   // ============================ Modeling: views ============================
 
   /** Rename a view. config: { viewName, viewDesc? }. */
   renameView(workspaceId: string, viewId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/views/${viewId}`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}`, { config });
   }
   /** Copy a view. config: { viewName, viewDesc?, copyWithData?, copyWithLookup?, folderId? }. */
   saveAsView(workspaceId: string, viewId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/saveas`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/saveas`, { config });
   }
   /** Move a view/table to trash (DELETE). config: { deleteDependentViews? }. */
   deleteView(workspaceId: string, viewId: string, config?: Config) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/views/${viewId}`, { config });
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}`, { config });
   }
   /** Move views into a folder. config: { folderId, viewIds: [...] }. */
   moveViewsToFolder(workspaceId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/views/movetofolder`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/views/movetofolder`, { config });
   }
   /** Restore a view from trash. config: { withDependents? }. */
   restoreTrashView(workspaceId: string, viewId: string, config?: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/trash/${viewId}`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/trash/${enc(viewId)}`, { config });
   }
   /** Permanently delete a view from trash. config: { withDependents? }. */
   deleteTrashView(workspaceId: string, viewId: string, config?: Config) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/trash/${viewId}`, { config });
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/trash/${enc(viewId)}`, { config });
   }
 
   // ============================ Sharing API ============================
 
   /** config: { emailIds, viewIds, permissions:{read,...}, groupIds?, criteria?, inviteMail?, ... }. */
   shareViews(workspaceId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/share`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/views/share`, { config });
   }
   updateSharedViews(workspaceId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/views/share`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/views/share`, { config });
   }
   /** config: { emailIds, viewIds?, removeAllViews?, groupIds? }. */
   removeShare(workspaceId: string, config: Config) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/views/share`, { config });
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/views/share`, { config });
   }
   getSharedDetails(workspaceId: string, viewIds: string[]) {
-    return this.request("GET", `/workspaces/${workspaceId}/share/shareddetails`, { config: { viewIds } });
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/share/shareddetails`, { config: { viewIds } });
   }
   getWorkspaceSharedDetails(workspaceId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/share`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/share`);
   }
   getMyPermissions(workspaceId: string, viewId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/views/${viewId}/share/mypermissions`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/share/mypermissions`);
   }
   getWorkspaceAdmins(workspaceId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/admins`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/admins`);
   }
   /** config: { emailIds, inviteMail? }. */
   addWorkspaceAdmins(workspaceId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/admins`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/admins`, { config });
   }
   removeWorkspaceAdmins(workspaceId: string, config: Config) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/admins`, { config });
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/admins`, { config });
   }
   getOrgAdmins() {
     return this.request("GET", "/orgadmins");
   }
   getGroups(workspaceId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/groups`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/groups`);
   }
   /** config: { groupName, emailIds, groupDesc?, inviteMail? }. */
   createGroup(workspaceId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/groups`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/groups`, { config });
   }
   getGroupDetails(workspaceId: string, groupId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/groups/${groupId}`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/groups/${enc(groupId)}`);
   }
   renameGroup(workspaceId: string, groupId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/groups/${groupId}`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/groups/${enc(groupId)}`, { config });
   }
   deleteGroup(workspaceId: string, groupId: string) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/groups/${groupId}`);
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/groups/${enc(groupId)}`);
   }
   addGroupMembers(workspaceId: string, groupId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/groups/${groupId}/members`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/groups/${enc(groupId)}/members`, { config });
   }
   removeGroupMembers(workspaceId: string, groupId: string, config: Config) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/groups/${groupId}/members`, { config });
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/groups/${enc(groupId)}/members`, { config });
   }
 
   // ============================ User Management API ============================
@@ -780,90 +861,90 @@ export class ZohoAnalyticsClient {
     return this.request("GET", "/resources");
   }
   getWorkspaceUsers(workspaceId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/users`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/users`);
   }
   addWorkspaceUsers(workspaceId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/users`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/users`, { config });
   }
   deleteWorkspaceUsers(workspaceId: string, config: Config) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/users`, { config });
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/users`, { config });
   }
   /** config: { emailIds, operation (activate|deactivate) }. */
   changeWorkspaceUsersStatus(workspaceId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/users/status`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/users/status`, { config });
   }
   /** config: { emailIds, role (USER|WORKSPACEADMIN|<custom>) }. */
   changeWorkspaceUsersRole(workspaceId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/users/role`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/users/role`, { config });
   }
 
   // ============================ Embed / publish API ============================
 
   getViewUrl(workspaceId: string, viewId: string, config?: Config): Promise<unknown> {
-    return this.request("GET", `/workspaces/${workspaceId}/views/${viewId}/publish`, { config });
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/publish`, { config });
   }
   getEmbedUrl(workspaceId: string, viewId: string, config?: Config) {
-    return this.request("GET", `/workspaces/${workspaceId}/views/${viewId}/publish/embed`, { config });
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/publish/embed`, { config });
   }
   getPrivateUrl(workspaceId: string, viewId: string, config?: Config) {
-    return this.request("GET", `/workspaces/${workspaceId}/views/${viewId}/publish/privatelink`, { config });
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/publish/privatelink`, { config });
   }
   createPrivateUrl(workspaceId: string, viewId: string, config?: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/publish/privatelink`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/publish/privatelink`, { config });
   }
   removePrivateUrl(workspaceId: string, viewId: string) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/views/${viewId}/publish/privatelink`);
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/publish/privatelink`);
   }
   /** config: { publicPermLevel?, permissions?, criteria? }. */
   makeViewPublic(workspaceId: string, viewId: string, config?: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/publish/public`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/publish/public`, { config });
   }
   removePublic(workspaceId: string, viewId: string) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/views/${viewId}/publish/public`);
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/publish/public`);
   }
   getPublishConfig(workspaceId: string, viewId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/views/${viewId}/publish/config`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/publish/config`);
   }
   updatePublishConfig(workspaceId: string, viewId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/views/${viewId}/publish/config`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/publish/config`, { config });
   }
   getSlideshows(workspaceId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/slides`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/slides`);
   }
   /** config: { slideName, viewIds, accessType? }. */
   createSlideshow(workspaceId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/slides`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/slides`, { config });
   }
   getSlideshowDetails(workspaceId: string, slideId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/slides/${slideId}`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/slides/${enc(slideId)}`);
   }
   updateSlideshow(workspaceId: string, slideId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/slides/${slideId}`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/slides/${enc(slideId)}`, { config });
   }
   deleteSlideshow(workspaceId: string, slideId: string) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/slides/${slideId}`);
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/slides/${enc(slideId)}`);
   }
   getSlideshowUrl(workspaceId: string, slideId: string, config?: Config) {
-    return this.request("GET", `/workspaces/${workspaceId}/slides/${slideId}/publish`, { config });
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/slides/${enc(slideId)}/publish`, { config });
   }
 
   // ============================ Variables ============================
 
   getVariables(workspaceId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/variables`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/variables`);
   }
   /** config: { variableName, variableType, variableDataType, defaultData?, ... }. */
   createVariable(workspaceId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/variables`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/variables`, { config });
   }
   getVariableDetails(workspaceId: string, variableId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/variables/${variableId}`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/variables/${enc(variableId)}`);
   }
   updateVariable(workspaceId: string, variableId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/variables/${variableId}`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/variables/${enc(variableId)}`, { config });
   }
   deleteVariable(workspaceId: string, variableId: string) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/variables/${variableId}`);
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/variables/${enc(variableId)}`);
   }
 
   // ============================ Synchronous & batch imports ============================
@@ -875,19 +956,31 @@ export class ZohoAnalyticsClient {
   }
   /** Synchronous import into an EXISTING table (returns the import result inline, no job). */
   importDataSync(workspaceId: string, viewId: string, file: { content: string; name: string; type?: string }, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/data`, { config, form: this.importForm(file) });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/data`, { config, form: this.importForm(file) });
   }
   /** Synchronous import that CREATES a new table. config: { tableName, fileType, autoIdentify, ... }. */
   importDataSyncNewTable(workspaceId: string, file: { content: string; name: string; type?: string }, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/data`, { config, form: this.importForm(file) });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/data`, { config, form: this.importForm(file) });
   }
-  /** Batch import (chunked upload) into an existing table — async job. */
+  /**
+   * Batch import (chunked upload) into an existing table — async job.
+   * batchKey/isLastBatch are MANDATORY in the batch protocol; default to a
+   * single-batch upload ("start" + last). To continue a multi-batch upload,
+   * override them in `config` (batchKey from the previous response, isLastBatch
+   * "true" only on the final chunk).
+   */
   createBatchImportJob(workspaceId: string, viewId: string, file: { content: string; name: string; type?: string }, config: Config) {
-    return this.request("POST", `/bulk/workspaces/${workspaceId}/views/${viewId}/data/batch`, { config, form: this.importForm(file) });
+    return this.request("POST", `/bulk/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/data/batch`, {
+      config: { batchKey: "start", isLastBatch: "true", ...config },
+      form: this.importForm(file),
+    });
   }
-  /** Batch import (chunked upload) creating a new table — async job. */
+  /** Batch import (chunked upload) creating a new table — async job. Same batchKey/isLastBatch semantics as above. */
   createBatchImportJobNewTable(workspaceId: string, file: { content: string; name: string; type?: string }, config: Config) {
-    return this.request("POST", `/bulk/workspaces/${workspaceId}/data/batch`, { config, form: this.importForm(file) });
+    return this.request("POST", `/bulk/workspaces/${enc(workspaceId)}/data/batch`, {
+      config: { batchKey: "start", isLastBatch: "true", ...config },
+      form: this.importForm(file),
+    });
   }
 
   // ============================ Metadata: dashboards / dependents / formulas (reads) ============================
@@ -899,129 +992,131 @@ export class ZohoAnalyticsClient {
     return this.request("GET", "/dashboards/shared");
   }
   getViewDependents(workspaceId: string, viewId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/views/${viewId}/dependents`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/dependents`);
   }
   getColumnDependents(workspaceId: string, viewId: string, columnId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/views/${viewId}/columns/${columnId}/dependents`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/columns/${enc(columnId)}/dependents`);
   }
   getCustomFormulas(workspaceId: string, viewId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/views/${viewId}/customformulas`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/customformulas`);
   }
   getViewAggregateFormulas(workspaceId: string, viewId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/views/${viewId}/aggregateformulas`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/aggregateformulas`);
   }
   getWorkspaceAggregateFormulas(workspaceId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/aggregateformulas`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/aggregateformulas`);
   }
   getAggregateFormulaDependents(workspaceId: string, formulaId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/aggregateformulas/${formulaId}/dependents`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/aggregateformulas/${enc(formulaId)}/dependents`);
   }
   /** Evaluate an aggregate formula and return its current value. */
   getAggregateFormulaValue(workspaceId: string, formulaId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/aggregateformulas/${formulaId}/value`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/aggregateformulas/${enc(formulaId)}/value`);
   }
   getLastImportDetails(workspaceId: string, viewId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/views/${viewId}/importdetails`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/importdetails`);
   }
   /** Export selected views as a reusable template ZIP, returned base64-encoded. */
   exportAsTemplate(workspaceId: string, viewIds: string[]): Promise<string> {
-    return this.requestRaw("GET", `/workspaces/${workspaceId}/template/data`, { config: { viewIds }, binary: true });
+    return this.requestRaw("GET", `/workspaces/${enc(workspaceId)}/template/data`, { config: { viewIds }, binary: true });
   }
 
   // ============================ Metadata: favorites / default / domain access ============================
 
   setFavoriteWorkspace(workspaceId: string, favorite: boolean) {
-    return this.request(favorite ? "POST" : "DELETE", `/workspaces/${workspaceId}/favorite`);
+    return this.request(favorite ? "POST" : "DELETE", `/workspaces/${enc(workspaceId)}/favorite`);
   }
   setFavoriteView(workspaceId: string, viewId: string, favorite: boolean) {
-    return this.request(favorite ? "POST" : "DELETE", `/workspaces/${workspaceId}/views/${viewId}/favorite`);
+    return this.request(favorite ? "POST" : "DELETE", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/favorite`);
   }
   setDefaultWorkspace(workspaceId: string, isDefault: boolean) {
-    return this.request(isDefault ? "POST" : "DELETE", `/workspaces/${workspaceId}/default`);
+    return this.request(isDefault ? "POST" : "DELETE", `/workspaces/${enc(workspaceId)}/default`);
   }
   /** Enable/disable white-label (custom domain) access for a workspace. */
   setWorkspaceDomainAccess(workspaceId: string, enabled: boolean) {
-    return this.request(enabled ? "POST" : "DELETE", `/workspaces/${workspaceId}/wlaccess`);
+    return this.request(enabled ? "POST" : "DELETE", `/workspaces/${enc(workspaceId)}/wlaccess`);
   }
 
   // ============================ Data sources & sync ============================
 
-  /** Trigger a data sync for a datasource. (Path per Zoho's OAS; their SDK uses plural "datasources" — verify live.) */
+  /** Trigger a data sync for a datasource. (Plural "datasources" per Zoho's live docs + SDK; their OAS says singular.) */
   syncDatasource(workspaceId: string, datasourceId: string) {
-    return this.request("POST", `/workspaces/${workspaceId}/datasource/${datasourceId}/sync`);
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/datasources/${enc(datasourceId)}/sync`);
   }
   /** Update a datasource's connection config (opaque JSON per Zoho's spec). */
   updateDatasourceConnection(workspaceId: string, datasourceId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/datasource/${datasourceId}`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/datasources/${enc(datasourceId)}`, { config });
   }
   /** Re-fetch a view's data from its source. */
   refetchViewData(workspaceId: string, viewId: string) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/sync`);
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/sync`);
   }
 
   // ============================ Modeling: folders / formulas / analysis ============================
 
   makeDefaultFolder(workspaceId: string, folderId: string) {
-    return this.request("POST", `/workspaces/${workspaceId}/folders/${folderId}/default`);
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/folders/${enc(folderId)}/default`);
   }
   /** Change folder hierarchy. config: { hierarchy (0=parent, 1=child), parentFolderId? }. */
   moveFolder(workspaceId: string, folderId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/folders/${folderId}/move`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/folders/${enc(folderId)}/move`, { config });
   }
   /** Reposition a folder. config: { referenceFolderId }. */
   reorderFolder(workspaceId: string, folderId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/folders/${folderId}/reorder`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/folders/${enc(folderId)}/reorder`, { config });
   }
   /** Copy formula columns to a matching table elsewhere. config: { formulaColumnNames, destWorkspaceId, workspaceKey? }. destOrgId required. */
   copyFormulas(workspaceId: string, viewId: string, config: Config, destOrgId: string) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/formulas/copy`, {
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/formulas/copy`, {
       config,
       headers: { "ZANALYTICS-DEST-ORGID": destOrgId },
     });
   }
   /** Create views similar to a reference view. config: { referenceViewId, folderId, copyCustomFormula?, copyAggFormula? }. */
   createSimilarViews(workspaceId: string, viewId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/similarviews`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/similarviews`, { config });
   }
   /** Auto-generate reports for a view. */
   autoAnalyseView(workspaceId: string, viewId: string) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/autoanalyse`);
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/autoanalyse`);
   }
   /** Auto-generate reports for a single column. */
   autoAnalyseColumn(workspaceId: string, viewId: string, columnId: string) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/columns/${columnId}/autoanalyse`);
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/columns/${enc(columnId)}/autoanalyse`);
   }
   /** Edit a formula column. config: { expression, description? }. */
   editFormulaColumn(workspaceId: string, viewId: string, formulaId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/views/${viewId}/customformulas/${formulaId}`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/customformulas/${enc(formulaId)}`, { config });
   }
   /** Edit an aggregate formula. config: { expression, description? }. */
   editAggregateFormula(workspaceId: string, viewId: string, formulaId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/views/${viewId}/aggregateformulas/${formulaId}`, { config });
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/aggregateformulas/${enc(formulaId)}`, { config });
   }
 
   // ============================ Email schedules ============================
 
   getEmailSchedules(workspaceId: string) {
-    return this.request("GET", `/workspaces/${workspaceId}/emailschedules`);
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/emailschedules`);
   }
+  // Email-schedule paths are workspace-scoped per Zoho's live docs + SDK samples
+  // (their OAS nests them under /views/{id} — the docs' curl samples win here).
   /** config: { scheduleName, viewIds, exportType, scheduleDetails:{calendarFrequency,hour,minute,...}, emailIds?, ... }. */
-  createEmailSchedule(workspaceId: string, viewId: string, config: Config) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/emailschedules`, { config });
+  createEmailSchedule(workspaceId: string, config: Config) {
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/emailschedules`, { config });
   }
-  updateEmailSchedule(workspaceId: string, viewId: string, scheduleId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/views/${viewId}/emailschedules/${scheduleId}`, { config });
+  updateEmailSchedule(workspaceId: string, scheduleId: string, config: Config) {
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/emailschedules/${enc(scheduleId)}`, { config });
   }
-  deleteEmailSchedule(workspaceId: string, viewId: string, scheduleId: string) {
-    return this.request("DELETE", `/workspaces/${workspaceId}/views/${viewId}/emailschedules/${scheduleId}`);
+  deleteEmailSchedule(workspaceId: string, scheduleId: string) {
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/emailschedules/${enc(scheduleId)}`);
   }
-  /** Send the scheduled email immediately. */
-  triggerEmailSchedule(workspaceId: string, viewId: string, scheduleId: string) {
-    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/emailschedules/${scheduleId}/trigger`);
+  /** Send the scheduled email immediately (POST on the schedule resource — no /trigger suffix per the live docs). */
+  triggerEmailSchedule(workspaceId: string, scheduleId: string) {
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/emailschedules/${enc(scheduleId)}`);
   }
   /** config: { operation: "activate" | "deactivate" }. */
-  changeEmailScheduleStatus(workspaceId: string, viewId: string, scheduleId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${workspaceId}/views/${viewId}/emailschedules/${scheduleId}/status`, { config });
+  changeEmailScheduleStatus(workspaceId: string, scheduleId: string, config: Config) {
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/emailschedules/${enc(scheduleId)}/status`, { config });
   }
 
   // ============================ AutoML ============================
@@ -1030,37 +1125,37 @@ export class ZohoAnalyticsClient {
     return this.request("GET", "/automl/analysis");
   }
   getAutoMLAnalysisInWorkspace(workspaceId: string) {
-    return this.request("GET", `/automl/workspaces/${workspaceId}/analysis`);
+    return this.request("GET", `/automl/workspaces/${enc(workspaceId)}/analysis`);
   }
   getAutoMLAnalysisDetails(workspaceId: string, analysisId: string) {
-    return this.request("GET", `/automl/workspaces/${workspaceId}/analysis/${analysisId}`);
+    return this.request("GET", `/automl/workspaces/${enc(workspaceId)}/analysis/${enc(analysisId)}`);
   }
   getAutoMLModelDeployments(workspaceId: string, analysisId: string, modelId: string) {
-    return this.request("GET", `/automl/workspaces/${workspaceId}/analysis/${analysisId}/models/${modelId}/deployments`);
+    return this.request("GET", `/automl/workspaces/${enc(workspaceId)}/analysis/${enc(analysisId)}/models/${enc(modelId)}/deployments`);
   }
   /** config: { name, trainingTableId, predictionType (REGRESSION|CLASSIFICATION|CLUSTERING), features, serverOption, algorithms, targetColumn?, ... }. */
   createAutoMLAnalysis(workspaceId: string, config: Config) {
-    return this.request("POST", `/automl/workspaces/${workspaceId}/analysis`, { config });
+    return this.request("POST", `/automl/workspaces/${enc(workspaceId)}/analysis`, { config });
   }
   deleteAutoMLAnalysis(workspaceId: string, analysisId: string) {
-    return this.request("DELETE", `/automl/workspaces/${workspaceId}/analysis/${analysisId}`);
+    return this.request("DELETE", `/automl/workspaces/${enc(workspaceId)}/analysis/${enc(analysisId)}`);
   }
   deleteAutoMLModel(workspaceId: string, analysisId: string, modelId: string) {
-    return this.request("DELETE", `/automl/workspaces/${workspaceId}/analysis/${analysisId}/models/${modelId}`);
+    return this.request("DELETE", `/automl/workspaces/${enc(workspaceId)}/analysis/${enc(analysisId)}/models/${enc(modelId)}`);
   }
   /** config: { inputTableId, outputTable, scheduleDetails, outputColumns, predictionColumn, serverOption, importType, ... }. */
   createAutoMLDeployment(workspaceId: string, analysisId: string, modelId: string, config: Config) {
-    return this.request("POST", `/automl/workspaces/${workspaceId}/analysis/${analysisId}/models/${modelId}/deployments`, { config });
+    return this.request("POST", `/automl/workspaces/${enc(workspaceId)}/analysis/${enc(analysisId)}/models/${enc(modelId)}/deployments`, { config });
   }
   deleteAutoMLDeployment(workspaceId: string, analysisId: string, deploymentId: string) {
-    return this.request("DELETE", `/automl/workspaces/${workspaceId}/analysis/${analysisId}/deployments/${deploymentId}`);
+    return this.request("DELETE", `/automl/workspaces/${enc(workspaceId)}/analysis/${enc(analysisId)}/deployments/${enc(deploymentId)}`);
   }
   /** Run a deployment now. */
   runAutoMLDeployment(workspaceId: string, analysisId: string, deploymentId: string) {
-    return this.request("POST", `/automl/workspaces/${workspaceId}/analysis/${analysisId}/deployments/${deploymentId}/execute`);
+    return this.request("POST", `/automl/workspaces/${enc(workspaceId)}/analysis/${enc(analysisId)}/deployments/${enc(deploymentId)}/execute`);
   }
   /** What-if analysis. config: { features: { column: value, ... } }. */
   autoMLWhatIf(workspaceId: string, analysisId: string, modelId: string, config: Config) {
-    return this.request("POST", `/automl/workspaces/${workspaceId}/analysis/${analysisId}/models/${modelId}/whatif`, { config });
+    return this.request("POST", `/automl/workspaces/${enc(workspaceId)}/analysis/${enc(analysisId)}/models/${enc(modelId)}/whatif`, { config });
   }
 }

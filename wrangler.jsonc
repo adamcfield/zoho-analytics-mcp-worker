@@ -8,5 +8,9 @@
     "bindings": [{ "name": "MCP_OBJECT", "class_name": "ZohoAnalyticsMCP" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ZohoAnalyticsMCP"] }],
+  // Strongly recommended in production: share one Zoho access token across all
+  // MCP sessions (Zoho caps token creation at ~10 per 10 min per refresh token).
+  // Create with `npx wrangler kv namespace create TOKEN_KV`, then uncomment:
+  // "kv_namespaces": [{ "binding": "TOKEN_KV", "id": "<your-kv-id>" }],
   "observability": { "enabled": true }
 }

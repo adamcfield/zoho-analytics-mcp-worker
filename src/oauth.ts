@@ -26,7 +26,7 @@ import OAuthProvider from "@cloudflare/workers-oauth-provider";
 import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ZohoAnalyticsClient } from "./zohoanalytics.js";
+import { ZohoAnalyticsClient, kvTokenStore } from "./zohoanalytics.js";
 import { registerTools } from "./tools.js";
 
 // Reuses the bearer worker's global Cloudflare.Env (MCP_OBJECT, ZOHO_*, etc.)
@@ -43,7 +43,7 @@ type AuthRequest = Awaited<ReturnType<OAuthHelpers["parseAuthRequest"]>>;
 
 /** The MCP agent — identical tool surface to the bearer worker. */
 export class ZohoAnalyticsMCP extends McpAgent<Env, unknown, Props> {
-  server = new McpServer({ name: "zoho-analytics", version: "1.2.0" });
+  server = new McpServer({ name: "zoho-analytics", version: "1.3.0" });
 
   async init(): Promise<void> {
     const client = new ZohoAnalyticsClient({
@@ -56,6 +56,9 @@ export class ZohoAnalyticsMCP extends McpAgent<Env, unknown, Props> {
       analyticsBaseUrl: this.env.ZOHO_ANALYTICS_BASE_URL,
       accountsBaseUrl: this.env.ZOHO_ACCOUNTS_BASE_URL,
       maxRetries: this.env.ZOHO_MAX_RETRIES ? Number(this.env.ZOHO_MAX_RETRIES) : undefined,
+      // Share one Zoho access token across all sessions via the OAuth KV —
+      // Zoho caps token creation (~10 per 10 min per refresh token).
+      tokenStore: kvTokenStore(this.env.OAUTH_KV),
     });
     registerTools(this.server, client, {
       orgId: this.env.ZOHO_ORG_ID,
@@ -130,6 +133,36 @@ async function clientName(env: Env, clientId: string): Promise<string> {
   }
 }
 
+// ---- Passphrase brute-force lockout (KV-backed, per client IP) ----
+// /authorize is public and the passphrase is the sole auth factor, so failed
+// attempts are throttled: MAX_ATTEMPTS failures within WINDOW_SECS locks that
+// IP out until the window expires. KV is eventually consistent (~60s), which is
+// fine for a coarse lockout — the goal is stopping brute force, not exactness.
+const MAX_ATTEMPTS = 10;
+const WINDOW_SECS = 900;
+
+function clientIp(request: Request): string {
+  return request.headers.get("cf-connecting-ip") ?? "unknown";
+}
+
+async function isLockedOut(env: Env, ip: string): Promise<boolean> {
+  try {
+    return Number((await env.OAUTH_KV.get(`authfail:${ip}`)) ?? 0) >= MAX_ATTEMPTS;
+  } catch {
+    return false; // a KV outage must not lock everyone out
+  }
+}
+
+async function recordFailedAttempt(env: Env, ip: string): Promise<void> {
+  try {
+    const key = `authfail:${ip}`;
+    const n = Number((await env.OAUTH_KV.get(key)) ?? 0) + 1;
+    await env.OAUTH_KV.put(key, String(n), { expirationTtl: WINDOW_SECS });
+  } catch {
+    /* best-effort */
+  }
+}
+
 async function handleAuthorize(request: Request, env: Env): Promise<Response> {
   if (request.method === "GET") {
     let reqInfo: AuthRequest;
@@ -154,8 +187,17 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
     }
     if (!reqInfo.clientId) return new Response("Invalid OAuth request", { status: 400 });
 
+    const ip = clientIp(request);
+    if (await isLockedOut(env, ip)) {
+      return new Response("Too many failed attempts. Try again later.", {
+        status: 429,
+        headers: { "retry-after": String(WINDOW_SECS) },
+      });
+    }
+
     // Fail closed: no passphrase configured -> reject everything.
     if (!env.APP_PASSPHRASE || !safeEqual(passphrase, env.APP_PASSPHRASE)) {
+      await recordFailedAttempt(env, ip);
       return consentPage(reqInfo, await clientName(env, reqInfo.clientId), "Incorrect passphrase. Try again.");
     }
 

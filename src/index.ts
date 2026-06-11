@@ -27,7 +27,7 @@
 
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ZohoAnalyticsClient } from "./zohoanalytics.js";
+import { ZohoAnalyticsClient, kvTokenStore } from "./zohoanalytics.js";
 import { registerTools } from "./tools.js";
 
 declare global {
@@ -46,6 +46,15 @@ declare global {
       MCP_AUTH_TOKEN: string;
       /** "true" => register read-only tools only. */
       MCP_READONLY?: string;
+      /**
+       * Optional KV namespace for sharing one Zoho access token across all MCP
+       * sessions. Strongly recommended in production: each session is its own
+       * Durable Object, and without a shared cache every new session mints its
+       * own token — Zoho caps token creation at ~10 per 10 min per refresh
+       * token. Create with `wrangler kv namespace create TOKEN_KV` and add a
+       * kv_namespaces entry to wrangler.jsonc.
+       */
+      TOKEN_KV?: KVNamespace;
     }
   }
 }
@@ -63,11 +72,12 @@ export function clientFromEnv(env: Env): ZohoAnalyticsClient {
     analyticsBaseUrl: env.ZOHO_ANALYTICS_BASE_URL,
     accountsBaseUrl: env.ZOHO_ACCOUNTS_BASE_URL,
     maxRetries: env.ZOHO_MAX_RETRIES ? Number(env.ZOHO_MAX_RETRIES) : undefined,
+    tokenStore: env.TOKEN_KV ? kvTokenStore(env.TOKEN_KV) : undefined,
   });
 }
 
 export class ZohoAnalyticsMCP extends McpAgent<Env> {
-  server = new McpServer({ name: "zoho-analytics", version: "1.2.0" });
+  server = new McpServer({ name: "zoho-analytics", version: "1.3.0" });
 
   async init(): Promise<void> {
     registerTools(this.server, clientFromEnv(this.env), {

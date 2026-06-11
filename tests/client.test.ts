@@ -187,7 +187,11 @@ describe("OAuth token refresh", () => {
     await c.getOrgs();
     expect(tokenCalls).toBe(1); // cached across the second call
     const tokenCall = f.mock.calls.find((call) => String(call[0]).includes("/oauth/v2/token"))!;
-    expect(String(tokenCall[0])).toContain("grant_type=refresh_token");
+    // Credentials travel in the POST body — never the URL (query strings get logged).
+    expect(String(tokenCall[0])).not.toContain("client_secret");
+    expect(String(tokenCall[0])).not.toContain("refresh_token=");
+    expect(String(tokenCall[1]?.body)).toContain("grant_type=refresh_token");
+    expect(String(tokenCall[1]?.body)).toContain("client_secret=s");
     const apiCall = f.mock.calls.find((call) => String(call[0]).includes("/restapi/v2/orgs"))!;
     expect(apiCall[1]?.headers).toMatchObject({ Authorization: "Zoho-oauthtoken AT1" });
   });
@@ -327,6 +331,79 @@ describe("full-coverage additions", () => {
     vi.stubGlobal("fetch", f);
     await mkStatic().runAutoMLDeployment("W", "A", "D");
     expect(String(f.mock.calls[0][0])).toContain("/automl/workspaces/W/analysis/A/deployments/D/execute");
+  });
+});
+
+describe("production hardening", () => {
+  it("URL-encodes caller-supplied ids in API paths (no path injection)", async () => {
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 }));
+    vi.stubGlobal("fetch", f);
+    await mkStatic().getWorkspaceDetails("../bulk/evil?x=1");
+    const url = String(f.mock.calls[0][0]);
+    expect(url).toContain("/workspaces/..%2Fbulk%2Fevil%3Fx%3D1");
+    expect(url).not.toContain("/workspaces/../");
+  });
+
+  it("batch import sends the mandatory batchKey/isLastBatch (single-batch defaults, caller-overridable)", async () => {
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(JSON.stringify({ status: "success", data: { jobId: "1" } }), { status: 200 }));
+    vi.stubGlobal("fetch", f);
+    await mkStatic().createBatchImportJob("W", "V", { content: "a\n1", name: "i.csv" }, { importType: "append" });
+    const url1 = decodeURIComponent(String(f.mock.calls[0][0]));
+    expect(url1).toContain('"batchKey":"start"');
+    expect(url1).toContain('"isLastBatch":"true"');
+    await mkStatic().createBatchImportJob("W", "V", { content: "b\n2", name: "i.csv" }, { batchKey: "k123", isLastBatch: "false" });
+    const url2 = decodeURIComponent(String(f.mock.calls[1][0]));
+    expect(url2).toContain('"batchKey":"k123"');
+    expect(url2).toContain('"isLastBatch":"false"');
+  });
+
+  it("email-schedule writes are workspace-scoped and trigger has no /trigger suffix (live-docs paths)", async () => {
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", f);
+    const c = mkStatic();
+    await c.createEmailSchedule("W", { scheduleName: "s" });
+    await c.triggerEmailSchedule("W", "SID");
+    await c.changeEmailScheduleStatus("W", "SID", { operation: "activate" });
+    const urls = f.mock.calls.map((call) => String(call[0]));
+    expect(urls[0]).toContain("/workspaces/W/emailschedules");
+    expect(urls[0]).not.toContain("/views/");
+    expect(urls[1]).toMatch(/\/workspaces\/W\/emailschedules\/SID$/);
+    expect(urls[2]).toContain("/workspaces/W/emailschedules/SID/status");
+  });
+
+  it("datasource paths use the plural segment per Zoho's live docs", async () => {
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", f);
+    await mkStatic().syncDatasource("W", "DS");
+    expect(String(f.mock.calls[0][0])).toContain("/workspaces/W/datasources/DS/sync");
+  });
+
+  it("uses a shared token store: a stored valid token avoids the token endpoint entirely", async () => {
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 }));
+    vi.stubGlobal("fetch", f);
+    const store = {
+      get: vi.fn(async () => ({ token: "STORED", expiry: Date.now() + 3_000_000 })),
+      set: vi.fn(async () => {}),
+    };
+    const c = new ZohoAnalyticsClient({ clientId: "c", clientSecret: "s", refreshToken: "r", dc: "com", backoffBaseMs: 1, tokenStore: store });
+    await c.getOrgs();
+    expect(store.get).toHaveBeenCalled();
+    expect(f.mock.calls.some((call) => String(call[0]).includes("/oauth/v2/token"))).toBe(false);
+    expect(f.mock.calls[0][1]?.headers).toMatchObject({ Authorization: "Zoho-oauthtoken STORED" });
+  });
+
+  it("writes a freshly minted token back to the store", async () => {
+    const f = vi.fn(async (...[url]: FetchArgs) => {
+      if (String(url).includes("/oauth/v2/token")) {
+        return new Response(JSON.stringify({ access_token: "NEW", expires_in: 3600 }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", f);
+    const store = { get: vi.fn(async () => null), set: vi.fn(async () => {}) };
+    const c = new ZohoAnalyticsClient({ clientId: "c", clientSecret: "s", refreshToken: "r", dc: "com", backoffBaseMs: 1, tokenStore: store });
+    await c.getOrgs();
+    expect(store.set).toHaveBeenCalledWith("NEW", expect.any(Number));
   });
 });
 

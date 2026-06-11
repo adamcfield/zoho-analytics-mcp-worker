@@ -10,10 +10,15 @@ or contact the maintainer directly.
 
 - **Auth-gated, fail-closed.** The bearer worker requires `Authorization: Bearer <MCP_AUTH_TOKEN>`
   (constant-time compare; if no token is configured, everything returns 401). The OAuth worker
-  gates on OAuth 2.1 + a passphrase. The Zoho OAuth credentials never leave the Worker.
-- **Tokens minted on demand.** The long-lived Zoho refresh token + client secret stay in Worker
-  secrets; short-lived access tokens are fetched on demand and cached only in the Durable Object's
-  memory. A 401 from Zoho triggers exactly one transparent refresh-and-retry.
+  gates on OAuth 2.1 + a passphrase, with a KV-backed per-IP lockout (10 failed passphrase
+  attempts → 429 for 15 minutes). The Zoho OAuth credentials never leave the Worker.
+- **Tokens minted on demand, secrets never in URLs.** The long-lived Zoho refresh token + client
+  secret stay in Worker secrets and travel only in the token-request **POST body** (query strings
+  are routinely captured by access logs and middleboxes). Short-lived access tokens are cached in
+  memory and, when a KV token store is configured, shared across sessions so token-mint rate
+  limits aren't tripped. A 401 from Zoho triggers exactly one transparent refresh-and-retry.
+- **Path-injection safe.** Every caller-supplied id is `encodeURIComponent`-ed before being
+  interpolated into an API path, so a malicious id (`../`, `?`, `#`) cannot redirect the request.
 - **Per-session isolation.** Each MCP session runs in its own Durable Object instance — server
   and transport objects are not shared across clients.
 - **Safe by default.** Write/state-changing calls (add/update/delete row, import, create, delete

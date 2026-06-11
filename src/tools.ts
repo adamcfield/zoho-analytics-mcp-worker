@@ -29,7 +29,24 @@ type ToolResult = {
 type AnyRec = Record<string, any>;
 
 function ok(data: unknown): ToolResult {
-  return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+  // Pretty-print small results for readability; large ones (row exports) go
+  // compact — indentation roughly doubles the token cost of a 1000-row result.
+  const compact = JSON.stringify(data);
+  const text = compact.length > 4000 ? compact : JSON.stringify(data, null, 2);
+  return { content: [{ type: "text", text }] };
+}
+
+// Raw bodies larger than this are refused instead of parsed — a sync export of a
+// huge view can otherwise exhaust the Durable Object's memory (the JSON parse +
+// row array cost a multiple of the body size). Thrown inside run(), which turns
+// it into a tool error.
+const MAX_EXPORT_BODY_CHARS = 10_000_000;
+function guardExportSize(size: number): void {
+  if (size <= MAX_EXPORT_BODY_CHARS) return;
+  throw new Error(
+    `Export body is ${Math.round(size / 1_000_000)}MB — too large to parse in the Worker. ` +
+      `Narrow it with criteria/selected_columns (or LIMIT in SQL), or use zoho_create_export_job with response_format=csv and page the download.`,
+  );
 }
 
 function fail(message: string): ToolResult {
@@ -169,6 +186,15 @@ export function registerTools(
   const writeTool: McpServer["registerTool"] = opts.readOnly
     ? noop
     : (server.registerTool.bind(server) as McpServer["registerTool"]);
+
+  // Merge advanced/passthrough CONFIG keys into a base config object.
+  const adv = (base: Record<string, unknown>, options?: Record<string, unknown>) => ({ ...base, ...(options ?? {}) });
+  const ID = (label: string) => z.string().describe(label);
+  const emails = z.array(z.string()).describe("Email address(es).");
+  const advOpt = z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe("Advanced CONFIG keys merged into the request (see Zoho Analytics API docs for the full list).");
 
   // ============================ Reads ============================
 
@@ -362,6 +388,7 @@ export function registerTools(
         if (criteria) config.criteria = criteria;
         if (selected_columns?.length) config.selectedColumns = selected_columns;
         const raw = await client.exportData(workspace_id, view_id, config);
+        guardExportSize(raw.length);
         if (fmt !== "json") {
           const capped = raw.length > 100_000;
           return { format: fmt, data: capped ? raw.slice(0, 100_000) : raw, truncated_chars: capped };
@@ -412,6 +439,7 @@ export function registerTools(
           await sleep(interval);
         }
         const raw = await client.downloadExportData(workspace_id, String(jobId));
+        guardExportSize(raw.length);
         const { rows, raw: rawJson } = parseExportRows(raw);
         if (rows.length === 0 && rawJson !== undefined) return { job_id: jobId, done: true, row_count: 0, raw: rawJson.slice(0, 50_000) };
         const { rows: out, truncated, total } = capRows(rows, max_rows ?? 1000);
@@ -475,6 +503,7 @@ export function registerTools(
         };
         if (!download || code !== JOB_CODE.COMPLETED) return status;
         const raw = await client.downloadExportData(workspace_id, job_id);
+        guardExportSize(raw.length);
         const { rows, raw: rawJson } = parseExportRows(raw);
         if (rows.length === 0) {
           // CSV (or unrecognized) — return raw text, capped.
@@ -625,6 +654,7 @@ export function registerTools(
         matching_columns: z.array(z.string()).optional().describe("Key columns for updateadd (upsert). Required when import_type=updateadd."),
         auto_identify: z.boolean().optional().describe("Auto-identify column data types (default true)."),
         on_error: z.enum(["abort", "skiprow", "setcolumnempty"]).optional().describe("Behavior on a bad row (default abort)."),
+        options: advOpt,
         wait: z.boolean().optional().describe("Wait for the job to complete and return its summary (default true)."),
         timeout_seconds: z.number().int().min(1).max(60).optional().describe("Max seconds to wait when wait=true (default 30, cap 60)."),
         dry_run: z.boolean().optional().describe("Preview the import config without uploading anything."),
@@ -638,6 +668,11 @@ export function registerTools(
         return fail("matching_columns is required when import_type=updateadd (the key columns to match on).");
       }
       const mode = a.mode ?? "async";
+      if (a.data.length > 25_000_000) {
+        return fail(
+          `Import payload is ${Math.round(a.data.length / 1_000_000)}MB — too large to pass through the Worker as a tool argument. Split the file and import in chunks (mode=async, import_type=append).`,
+        );
+      }
       if (a.dry_run) {
         return ok({
           dry_run: true,
@@ -658,6 +693,7 @@ export function registerTools(
         onError: a.on_error ?? "abort",
       };
       if (a.matching_columns?.length) config.matchingColumns = a.matching_columns;
+      if (a.options) Object.assign(config, a.options);
       const file = { content: a.data, name: `import.${fileType}`, type: fileType === "json" ? "application/json" : "text/csv" };
       if (mode === "sync") {
         return run(() => client.importDataSync(a.workspace_id, a.view_id, file, config));
@@ -769,15 +805,6 @@ export function registerTools(
     },
   );
 
-  // Merge advanced/passthrough CONFIG keys into a base config object.
-  const adv = (base: Record<string, unknown>, options?: Record<string, unknown>) => ({ ...base, ...(options ?? {}) });
-  const ID = (label: string) => z.string().describe(label);
-  const emails = z.array(z.string()).describe("Email address(es).");
-  const advOpt = z
-    .record(z.string(), z.unknown())
-    .optional()
-    .describe("Advanced CONFIG keys merged into the request (see Zoho Analytics API docs for the full list).");
-
   // ============================ Discovery (reads) ============================
 
   server.registerTool(
@@ -816,7 +843,8 @@ export function registerTools(
   server.registerTool(
     "zoho_get_view_metadata",
     {
-      description: "Get a table/view's column metadata (data types etc.).",
+      description:
+        "Get ONLY the column list of a table (names, columnId values, data types) via the workspace-scoped metadata endpoint. Use this when you need columnId values for the column tools (rename/delete/hide/lookup). For general view info (type, description, plus columns), prefer zoho_get_view_details.",
       inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id.") },
       annotations: { title: "Get view metadata", ...READ_ONLY },
     },
@@ -826,7 +854,8 @@ export function registerTools(
   server.registerTool(
     "zoho_get_trash",
     {
-      description: "List the views currently in a workspace's trash (with who/when deleted). Restore with zoho_restore_view.",
+      description:
+        "List the views currently in a workspace's trash (with who/when deleted). Restore with zoho_restore_view (a write tool — absent on read-only deploys).",
       inputSchema: { workspace_id: ID("Workspace id.") },
       annotations: { title: "Get trash", ...READ_ONLY },
     },
@@ -1387,7 +1416,7 @@ export function registerTools(
     "zoho_get_workspace_secret_key",
     {
       description:
-        "Get a workspace's CURRENT secret key (used to authorize cross-org copies). Read-only — to rotate the key use zoho_regenerate_workspace_secret_key.",
+        "Get a workspace's CURRENT secret key (used to authorize cross-org copies). Read-only — rotation is a separate write tool (zoho_regenerate_workspace_secret_key), absent on read-only deploys.",
       inputSchema: { workspace_id: ID("Workspace id.") },
       annotations: { title: "Get workspace secret key", ...READ_ONLY },
     },
@@ -1509,13 +1538,15 @@ export function registerTools(
       },
       annotations: { title: "Update shared views", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ workspace_id, email_ids, group_ids, permissions, options }) =>
-      run(() =>
+    async ({ workspace_id, email_ids, group_ids, permissions, options }) => {
+      audit("update_shared_views", { workspace_id, emails: email_ids?.length ?? 0, groups: group_ids?.length ?? 0 });
+      return run(() =>
         client.updateSharedViews(
           workspace_id,
           adv({ permissions, ...(email_ids ? { emailIds: email_ids } : {}), ...(group_ids ? { groupIds: group_ids } : {}) }, options),
         ),
-      ),
+      );
+    },
   );
 
   writeTool(
@@ -1644,7 +1675,10 @@ export function registerTools(
       inputSchema: { workspace_id: ID("Workspace id."), email_ids: emails },
       annotations: { title: "Remove workspace admins", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
-    async ({ workspace_id, email_ids }) => run(() => client.removeWorkspaceAdmins(workspace_id, { emailIds: email_ids })),
+    async ({ workspace_id, email_ids }) => {
+      audit("remove_workspace_admins", { workspace_id, count: email_ids.length });
+      return run(() => client.removeWorkspaceAdmins(workspace_id, { emailIds: email_ids }));
+    },
   );
 
   server.registerTool(
@@ -1744,7 +1778,10 @@ export function registerTools(
       inputSchema: { email_ids: emails, role: z.enum(["USER", "VIEWER", "ORGADMIN"]) },
       annotations: { title: "Change user role", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ email_ids, role }) => run(() => client.changeUserRole({ emailIds: email_ids, role })),
+    async ({ email_ids, role }) => {
+      audit("change_user_role", { count: email_ids.length, role });
+      return run(() => client.changeUserRole({ emailIds: email_ids, role }));
+    },
   );
 
   writeTool(
@@ -1814,7 +1851,8 @@ export function registerTools(
   server.registerTool(
     "zoho_get_private_url",
     {
-      description: "Get the existing private-link URL for a view (create one with zoho_create_private_url first).",
+      description:
+        "Get the existing private-link URL for a view (created earlier via zoho_create_private_url, a write tool absent on read-only deploys).",
       inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), options: advOpt },
       annotations: { title: "Get private URL", ...READ_ONLY },
     },
@@ -1828,7 +1866,10 @@ export function registerTools(
       inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), options: advOpt },
       annotations: { title: "Create private URL", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    async ({ workspace_id, view_id, options }) => run(() => client.createPrivateUrl(workspace_id, view_id, options)),
+    async ({ workspace_id, view_id, options }) => {
+      audit("create_private_url", { workspace_id, view_id });
+      return run(() => client.createPrivateUrl(workspace_id, view_id, options));
+    },
   );
 
   writeTool(
@@ -2091,7 +2132,15 @@ export function registerTools(
     async ({ workspace_id, view_ids }) =>
       run(async () => {
         const base64 = await client.exportAsTemplate(workspace_id, view_ids);
-        return { encoding: "base64", media_type: "application/zip", bytes: Math.floor((base64.length * 3) / 4), data: base64 };
+        // ~350k base64 chars ≈ 256KB ZIP. Beyond that the payload is useless in an
+        // LLM context — refuse with guidance instead of flooding the conversation.
+        if (base64.length > 350_000) {
+          throw new Error(
+            `Template ZIP is ~${Math.round((base64.length * 3) / 4 / 1024)}KB — too large to return inline. Export fewer views per call.`,
+          );
+        }
+        const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+        return { encoding: "base64", media_type: "application/zip", bytes: (base64.length * 3) / 4 - padding, data: base64 };
       }),
   );
 
@@ -2271,7 +2320,10 @@ export function registerTools(
       inputSchema: { workspace_id: ID("Workspace id."), enabled: z.boolean() },
       annotations: { title: "Set workspace domain access", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ workspace_id, enabled }) => run(() => client.setWorkspaceDomainAccess(workspace_id, enabled)),
+    async ({ workspace_id, enabled }) => {
+      audit("set_workspace_domain_access", { workspace_id, enabled });
+      return run(() => client.setWorkspaceDomainAccess(workspace_id, enabled));
+    },
   );
 
   // ============================ Data sources & sync ============================
@@ -2280,7 +2332,7 @@ export function registerTools(
     "zoho_sync_datasource",
     {
       description:
-        "Trigger an on-demand data sync for a datasource (get datasource ids from zoho_list_datasources). Note: Zoho's spec and SDK disagree on this path segment (datasource vs datasources); implemented per the official OpenAPI spec.",
+        "Trigger an on-demand data sync for a datasource (get datasource ids from zoho_list_datasources).",
       inputSchema: { workspace_id: ID("Workspace id."), datasource_id: ID("Datasource id.") },
       annotations: { title: "Sync datasource", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
@@ -2298,8 +2350,10 @@ export function registerTools(
       },
       annotations: { title: "Update datasource connection", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ workspace_id, datasource_id, connection_config }) =>
-      run(() => client.updateDatasourceConnection(workspace_id, datasource_id, connection_config)),
+    async ({ workspace_id, datasource_id, connection_config }) => {
+      audit("update_datasource_connection", { workspace_id, datasource_id, fields: Object.keys(connection_config) });
+      return run(() => client.updateDatasourceConnection(workspace_id, datasource_id, connection_config));
+    },
   );
 
   writeTool(
@@ -2331,7 +2385,6 @@ export function registerTools(
         "Create a scheduled email export of views. schedule_details: { calendarFrequency: daily|weekly|monthly|yearly, hour (0-23), minute (0,5,...,55), weekDays?/monthDays?/months? }. export_type: csv|xls|img|pdf|html. Sends recurring real emails once active.",
       inputSchema: {
         workspace_id: ID("Workspace id."),
-        view_id: ID("View id the schedule is created under."),
         schedule_name: z.string(),
         view_ids: z.array(z.string()).min(1).describe("Views to include in the emailed export."),
         export_type: z.enum(["csv", "xls", "img", "pdf", "html"]),
@@ -2343,12 +2396,11 @@ export function registerTools(
       },
       annotations: { title: "Create email schedule", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    async ({ workspace_id, view_id, schedule_name, view_ids, export_type, schedule_details, email_ids, subject, message, options }) => {
+    async ({ workspace_id, schedule_name, view_ids, export_type, schedule_details, email_ids, subject, message, options }) => {
       audit("create_email_schedule", { workspace_id, schedule_name, views: view_ids.length });
       return run(() =>
         client.createEmailSchedule(
           workspace_id,
-          view_id,
           adv(
             {
               scheduleName: schedule_name,
@@ -2372,27 +2424,28 @@ export function registerTools(
       description: "Update an email schedule. Pass the fields to change via options (scheduleName, viewIds, exportType, scheduleDetails, emailIds, ...).",
       inputSchema: {
         workspace_id: ID("Workspace id."),
-        view_id: ID("View id."),
         schedule_id: ID("Schedule id."),
         options: z.record(z.string(), z.unknown()).describe("Schedule fields to set."),
       },
       annotations: { title: "Update email schedule", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ workspace_id, view_id, schedule_id, options }) =>
-      run(() => client.updateEmailSchedule(workspace_id, view_id, schedule_id, options)),
+    async ({ workspace_id, schedule_id, options }) => {
+      audit("update_email_schedule", { workspace_id, schedule_id, fields: Object.keys(options) });
+      return run(() => client.updateEmailSchedule(workspace_id, schedule_id, options));
+    },
   );
 
   writeTool(
     "zoho_delete_email_schedule",
     {
       description: "Delete an email schedule.",
-      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), schedule_id: ID("Schedule id."), dry_run: z.boolean().optional() },
+      inputSchema: { workspace_id: ID("Workspace id."), schedule_id: ID("Schedule id."), dry_run: z.boolean().optional() },
       annotations: { title: "Delete email schedule", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
-    async ({ workspace_id, view_id, schedule_id, dry_run }) => {
+    async ({ workspace_id, schedule_id, dry_run }) => {
       if (dry_run) return ok({ dry_run: true, action: "delete_email_schedule", schedule_id, note: "Nothing was deleted." });
       audit("delete_email_schedule", { workspace_id, schedule_id });
-      return run(() => client.deleteEmailSchedule(workspace_id, view_id, schedule_id));
+      return run(() => client.deleteEmailSchedule(workspace_id, schedule_id));
     },
   );
 
@@ -2400,13 +2453,13 @@ export function registerTools(
     "zoho_trigger_email_schedule",
     {
       description: "Send a scheduled email NOW (out of schedule). Sends real email each call — dry_run previews.",
-      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), schedule_id: ID("Schedule id."), dry_run: z.boolean().optional() },
+      inputSchema: { workspace_id: ID("Workspace id."), schedule_id: ID("Schedule id."), dry_run: z.boolean().optional() },
       annotations: { title: "Trigger email schedule", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    async ({ workspace_id, view_id, schedule_id, dry_run }) => {
+    async ({ workspace_id, schedule_id, dry_run }) => {
       if (dry_run) return ok({ dry_run: true, action: "trigger_email_schedule", schedule_id, note: "Would send the scheduled email now. Nothing was sent." });
       audit("trigger_email_schedule", { workspace_id, schedule_id });
-      return run(() => client.triggerEmailSchedule(workspace_id, view_id, schedule_id));
+      return run(() => client.triggerEmailSchedule(workspace_id, schedule_id));
     },
   );
 
@@ -2416,14 +2469,15 @@ export function registerTools(
       description: "Activate or deactivate an email schedule.",
       inputSchema: {
         workspace_id: ID("Workspace id."),
-        view_id: ID("View id."),
         schedule_id: ID("Schedule id."),
         operation: z.enum(["activate", "deactivate"]),
       },
       annotations: { title: "Set email schedule status", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ workspace_id, view_id, schedule_id, operation }) =>
-      run(() => client.changeEmailScheduleStatus(workspace_id, view_id, schedule_id, { operation })),
+    async ({ workspace_id, schedule_id, operation }) => {
+      audit("set_email_schedule_status", { workspace_id, schedule_id, operation });
+      return run(() => client.changeEmailScheduleStatus(workspace_id, schedule_id, { operation }));
+    },
   );
 
   // ============================ AutoML ============================
@@ -2482,7 +2536,9 @@ export function registerTools(
       return run(() =>
         client.createAutoMLAnalysis(workspace_id, {
           name,
-          trainingTableId: Number(training_table_id),
+            // Sent as the original string: Zoho ids are 18-19 digits, which exceed
+          // Number.MAX_SAFE_INTEGER and would silently corrupt via Number().
+          trainingTableId: training_table_id,
           predictionType: prediction_type,
           features,
           algorithms,
@@ -2550,7 +2606,8 @@ export function registerTools(
       audit("create_automl_deployment", { workspace_id: a.workspace_id, analysis_id: a.analysis_id, model_id: a.model_id });
       return run(() =>
         client.createAutoMLDeployment(a.workspace_id, a.analysis_id, a.model_id, {
-          inputTableId: Number(a.input_table_id),
+          // String, not Number(): 18-19 digit ids exceed MAX_SAFE_INTEGER.
+          inputTableId: a.input_table_id,
           outputTable: a.output_table,
           predictionColumn: a.prediction_column,
           outputColumns: a.output_columns,

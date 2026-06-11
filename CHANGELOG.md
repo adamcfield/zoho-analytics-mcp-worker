@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.3.0 — Production hardening (second adversarial review + live verification)
+
+A 4-dimension adversarial review (v1.2.0 diff, production ops, security, MCP-consumer quality)
+confirmed 24 issues; all fixed. The worker was also booted and verified live for the first time
+(MCP handshake, 140 tools listed, graceful credential errors, MCP_READONLY = exactly 48 reads).
+
+### Fixed (functional)
+- **Batch imports work now:** the mandatory `batchKey`/`isLastBatch` CONFIG keys are sent
+  (single-batch defaults, caller-overridable for multi-batch chains).
+- **Email-schedule writes use the live-docs paths** (workspace-scoped, no `/views/{id}` segment,
+  trigger = POST on the schedule with no `/trigger` suffix) — Zoho's OAS disagrees with their own
+  docs + SDK here; the docs win. `view_id` removed from those 5 tools (it was also undiscoverable).
+- **Datasource sync/update use plural `datasources`** per live docs + SDK (OAS says singular).
+- **AutoML table ids are passed as strings** — `Number()` silently corrupted Zoho's 18-19 digit
+  ids (beyond `MAX_SAFE_INTEGER`).
+- **Binary template export detects failure envelopes** (a body starting `{` is decoded as JSON,
+  not returned as a fake ZIP).
+
+### Security
+- **Credentials out of URLs:** the OAuth token refresh sends refresh_token/client_secret in the
+  POST body, never the query string (query strings are logged by intermediaries).
+- **Path-injection closed:** all ~137 caller-supplied ids are `encodeURIComponent`-ed before path
+  interpolation.
+- **Passphrase brute-force lockout** on the OAuth worker: 10 failed attempts per IP → 429 for
+  15 minutes (KV-backed).
+
+### Production operations
+- **Cross-session access-token cache:** new `TokenStore` (KV-backed) shares one Zoho access token
+  across all MCP sessions — without it, each session-DO minted its own token against Zoho's
+  ~10-per-10-min cap. The OAuth worker uses `OAUTH_KV` automatically; the bearer worker takes an
+  optional `TOKEN_KV` binding (documented in wrangler.jsonc/README).
+- **Memory/context bounds:** sync exports/downloads refused over ~10MB, imports over ~25MB,
+  template ZIPs over ~256KB — each with actionable guidance. Large tool results are emitted as
+  compact JSON (pretty-printing doubled the token cost of row exports).
+- **Retry-After capped at 8s** so a 429 inside a polling loop can't sleep past the caller's
+  deadline. Audit lines added to the remaining privilege-sensitive writes (role changes, share
+  updates, domain access, datasource connection, email schedules, private URLs).
+- **Gated deploy workflow** (.github/workflows/deploy.yml): manual dispatch → typecheck + tests →
+  wrangler deploy → live smoke test.
+
+### MCP-consumer quality
+- zoho_get_view_metadata vs zoho_get_view_details disambiguated (metadata = column ids for the
+  column tools); read-tool descriptions that reference write tools now note those are absent on
+  read-only deploys; stale smoke-test comment fixed.
+- **50 tests** (path encoding, batch CONFIG, schedule paths, token store hit/write-back,
+  no-secrets-in-URL).
+
 ## 1.2.0 — 100% endpoint coverage (161/161)
 
 A spec-diff audit (every `(method, path)` pair in Zoho's seven official OpenAPI files vs. the
