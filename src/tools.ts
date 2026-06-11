@@ -614,13 +614,14 @@ export function registerTools(
     "zoho_import_data",
     {
       description:
-        "Bulk-import data (CSV or JSON text) into an existing table via an async job. import_type: 'append' (add rows), 'truncateadd' (REPLACE all data), or 'updateadd' (upsert — requires matching_columns). By default waits for the job to finish and returns the import summary; set wait=false to return the job_id immediately and poll zoho_get_import_job. Preview with dry_run.",
+        "Bulk-import data (CSV or JSON text) into an existing table. import_type: 'append' (add rows), 'truncateadd' (REPLACE all data), or 'updateadd' (upsert — requires matching_columns). mode: 'async' (default — job; waits and returns the summary unless wait=false), 'sync' (inline result, small files), or 'batch' (chunked async job). Preview with dry_run.",
       inputSchema: {
         workspace_id: z.string().describe("Workspace id."),
         view_id: z.string().describe("Target table id."),
         data: z.string().describe("The file content to import (CSV or JSON text)."),
         file_type: z.enum(["csv", "json"]).optional().describe("Format of `data` (default csv)."),
         import_type: z.enum(["append", "truncateadd", "updateadd"]).optional().describe("How to import (default append). truncateadd REPLACES all rows."),
+        mode: z.enum(["async", "sync", "batch"]).optional().describe("async job (default), sync inline, or batch (chunked job)."),
         matching_columns: z.array(z.string()).optional().describe("Key columns for updateadd (upsert). Required when import_type=updateadd."),
         auto_identify: z.boolean().optional().describe("Auto-identify column data types (default true)."),
         on_error: z.enum(["abort", "skiprow", "setcolumnempty"]).optional().describe("Behavior on a bad row (default abort)."),
@@ -636,6 +637,7 @@ export function registerTools(
       if (importType === "updateadd" && !a.matching_columns?.length) {
         return fail("matching_columns is required when import_type=updateadd (the key columns to match on).");
       }
+      const mode = a.mode ?? "async";
       if (a.dry_run) {
         return ok({
           dry_run: true,
@@ -643,11 +645,12 @@ export function registerTools(
           view_id: a.view_id,
           file_type: fileType,
           import_type: importType,
+          mode,
           bytes: a.data.length,
           note: importType === "truncateadd" ? "Would REPLACE all existing rows. Nothing was imported." : "Nothing was imported.",
         });
       }
-      audit("import_data", { workspace_id: a.workspace_id, view_id: a.view_id, import_type: importType, bytes: a.data.length });
+      audit("import_data", { workspace_id: a.workspace_id, view_id: a.view_id, import_type: importType, mode, bytes: a.data.length });
       const config: Record<string, unknown> = {
         importType,
         fileType,
@@ -655,13 +658,14 @@ export function registerTools(
         onError: a.on_error ?? "abort",
       };
       if (a.matching_columns?.length) config.matchingColumns = a.matching_columns;
+      const file = { content: a.data, name: `import.${fileType}`, type: fileType === "json" ? "application/json" : "text/csv" };
+      if (mode === "sync") {
+        return run(() => client.importDataSync(a.workspace_id, a.view_id, file, config));
+      }
       return run(async () => {
-        const created = (await client.createImportJob(
-          a.workspace_id,
-          a.view_id,
-          { content: a.data, name: `import.${fileType}`, type: fileType === "json" ? "application/json" : "text/csv" },
-          config,
-        )) as AnyRec;
+        const created = (await (mode === "batch"
+          ? client.createBatchImportJob(a.workspace_id, a.view_id, file, config)
+          : client.createImportJob(a.workspace_id, a.view_id, file, config))) as AnyRec;
         const jobId = created?.data?.jobId ?? created?.jobId;
         if (a.wait === false || !jobId) {
           return { job_id: jobId ?? null, done: false, note: "Poll zoho_get_import_job for the result.", raw: created?.data ?? created };
@@ -789,11 +793,14 @@ export function registerTools(
   server.registerTool(
     "zoho_list_dashboards",
     {
-      description: "List dashboards across the org (owned + shared).",
-      inputSchema: {},
+      description: "List dashboards across the org. scope: all (default), owned, or shared.",
+      inputSchema: { scope: z.enum(["all", "owned", "shared"]).optional().describe("Which dashboards to list (default all).") },
       annotations: { title: "List dashboards", ...READ_ONLY },
     },
-    async () => run(() => client.getDashboards()),
+    async ({ scope }) =>
+      run(() =>
+        scope === "owned" ? client.getOwnedDashboards() : scope === "shared" ? client.getSharedDashboards() : client.getDashboards(),
+      ),
   );
 
   server.registerTool(
@@ -1290,26 +1297,30 @@ export function registerTools(
   writeTool(
     "zoho_create_table_from_data",
     {
-      description: "Create a NEW table in a workspace from uploaded CSV/JSON text (Zoho infers the columns). Provide the table name and the file content.",
+      description:
+        "Create a NEW table in a workspace from uploaded CSV/JSON text (Zoho infers the columns). mode: 'async' job (default — returns a job_id to poll with zoho_get_import_job), 'sync' inline (small files), or 'batch' (chunked async job).",
       inputSchema: {
         workspace_id: ID("Workspace id."),
         table_name: z.string().describe("Name for the new table."),
         data: z.string().describe("File content (CSV or JSON text)."),
         file_type: z.enum(["csv", "json"]).optional().describe("Format of `data` (default csv)."),
         auto_identify: z.boolean().optional().describe("Auto-identify column data types (default true)."),
+        mode: z.enum(["async", "sync", "batch"]).optional().describe("async job (default), sync inline, or batch (chunked job)."),
         options: advOpt,
       },
       annotations: { title: "Create table from data", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    async ({ workspace_id, table_name, data, file_type, auto_identify, options }) => {
+    async ({ workspace_id, table_name, data, file_type, auto_identify, mode, options }) => {
       const fileType = file_type ?? "csv";
-      audit("create_table_from_data", { workspace_id, table_name, bytes: data.length });
+      audit("create_table_from_data", { workspace_id, table_name, mode: mode ?? "async", bytes: data.length });
+      const file = { content: data, name: `${table_name}.${fileType}`, type: fileType === "json" ? "application/json" : "text/csv" };
+      const config = adv({ tableName: table_name, fileType, autoIdentify: String(auto_identify ?? true) }, options);
       return run(() =>
-        client.createTableFromData(
-          workspace_id,
-          { content: data, name: `${table_name}.${fileType}`, type: fileType === "json" ? "application/json" : "text/csv" },
-          adv({ tableName: table_name, fileType, autoIdentify: String(auto_identify ?? true) }, options),
-        ),
+        mode === "sync"
+          ? client.importDataSyncNewTable(workspace_id, file, config)
+          : mode === "batch"
+            ? client.createBatchImportJobNewTable(workspace_id, file, config)
+            : client.createTableFromData(workspace_id, file, config),
       );
     },
   );
@@ -2003,5 +2014,596 @@ export function registerTools(
       annotations: { title: "Delete variable", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
     async ({ workspace_id, variable_id }) => run(() => client.deleteVariable(workspace_id, variable_id)),
+  );
+
+  // ============================ Dependents, formulas & import details (reads) ============================
+
+  server.registerTool(
+    "zoho_get_dependents",
+    {
+      description: "List the views that depend on a view — or, when column_id is given, on a specific column. Check before deleting either.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), column_id: z.string().optional().describe("Scope to one column.") },
+      annotations: { title: "Get dependents", ...READ_ONLY },
+    },
+    async ({ workspace_id, view_id, column_id }) =>
+      run(() => (column_id ? client.getColumnDependents(workspace_id, view_id, column_id) : client.getViewDependents(workspace_id, view_id))),
+  );
+
+  server.registerTool(
+    "zoho_list_formula_columns",
+    {
+      description: "List the custom (inline) formula columns of a table.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("Table id.") },
+      annotations: { title: "List formula columns", ...READ_ONLY },
+    },
+    async ({ workspace_id, view_id }) => run(() => client.getCustomFormulas(workspace_id, view_id)),
+  );
+
+  server.registerTool(
+    "zoho_list_aggregate_formulas",
+    {
+      description: "List aggregate formulas — of one table when view_id is given, else across the whole workspace.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: z.string().optional().describe("Scope to one table.") },
+      annotations: { title: "List aggregate formulas", ...READ_ONLY },
+    },
+    async ({ workspace_id, view_id }) =>
+      run(() => (view_id ? client.getViewAggregateFormulas(workspace_id, view_id) : client.getWorkspaceAggregateFormulas(workspace_id))),
+  );
+
+  server.registerTool(
+    "zoho_get_aggregate_formula_value",
+    {
+      description: "Evaluate an aggregate formula and return its current value.",
+      inputSchema: { workspace_id: ID("Workspace id."), formula_id: ID("Aggregate formula id.") },
+      annotations: { title: "Get aggregate formula value", ...READ_ONLY },
+    },
+    async ({ workspace_id, formula_id }) => run(() => client.getAggregateFormulaValue(workspace_id, formula_id)),
+  );
+
+  server.registerTool(
+    "zoho_get_aggregate_formula_dependents",
+    {
+      description: "List the views that depend on an aggregate formula.",
+      inputSchema: { workspace_id: ID("Workspace id."), formula_id: ID("Aggregate formula id.") },
+      annotations: { title: "Get aggregate formula dependents", ...READ_ONLY },
+    },
+    async ({ workspace_id, formula_id }) => run(() => client.getAggregateFormulaDependents(workspace_id, formula_id)),
+  );
+
+  server.registerTool(
+    "zoho_get_last_import_details",
+    {
+      description: "Get the details of the most recent data import into a table.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("Table id.") },
+      annotations: { title: "Get last import details", ...READ_ONLY },
+    },
+    async ({ workspace_id, view_id }) => run(() => client.getLastImportDetails(workspace_id, view_id)),
+  );
+
+  server.registerTool(
+    "zoho_export_workspace_template",
+    {
+      description:
+        "Export selected views as a reusable workspace-template ZIP, returned BASE64-encoded (decode and save as .zip). Useful for cloning a workspace structure.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_ids: z.array(z.string()).min(1).describe("Views to include in the template.") },
+      annotations: { title: "Export workspace template", ...READ_ONLY },
+    },
+    async ({ workspace_id, view_ids }) =>
+      run(async () => {
+        const base64 = await client.exportAsTemplate(workspace_id, view_ids);
+        return { encoding: "base64", media_type: "application/zip", bytes: Math.floor((base64.length * 3) / 4), data: base64 };
+      }),
+  );
+
+  writeTool(
+    "zoho_edit_formula_column",
+    {
+      description: "Update an inline formula column's expression (and optionally its description).",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_id: ID("Table id."),
+        formula_id: ID("Formula id."),
+        expression: z.string().describe("New formula expression."),
+        description: z.string().optional(),
+      },
+      annotations: { title: "Edit formula column", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, formula_id, expression, description }) =>
+      run(() => client.editFormulaColumn(workspace_id, view_id, formula_id, { expression, ...(description ? { description } : {}) })),
+  );
+
+  writeTool(
+    "zoho_edit_aggregate_formula",
+    {
+      description: "Update an aggregate formula's expression (and optionally its description).",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_id: ID("Table id."),
+        formula_id: ID("Formula id."),
+        expression: z.string().describe("New aggregate expression."),
+        description: z.string().optional(),
+      },
+      annotations: { title: "Edit aggregate formula", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, formula_id, expression, description }) =>
+      run(() => client.editAggregateFormula(workspace_id, view_id, formula_id, { expression, ...(description ? { description } : {}) })),
+  );
+
+  writeTool(
+    "zoho_copy_formulas",
+    {
+      description:
+        "Copy formula columns from a table to a matching table (same name + columns) in ANOTHER workspace/org. dest_org_id required; pass workspace_key for cross-org.",
+      inputSchema: {
+        workspace_id: ID("Source workspace id."),
+        view_id: ID("Source table id."),
+        formula_column_names: z.array(z.string()).min(1).describe("Formula column names to copy."),
+        dest_workspace_id: ID("Destination workspace id."),
+        dest_org_id: ID("Destination org id."),
+        workspace_key: z.string().optional().describe("Source workspace secret key (cross-org)."),
+      },
+      annotations: { title: "Copy formulas", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, formula_column_names, dest_workspace_id, dest_org_id, workspace_key }) =>
+      run(() =>
+        client.copyFormulas(
+          workspace_id,
+          view_id,
+          { formulaColumnNames: formula_column_names, destWorkspaceId: dest_workspace_id, ...(workspace_key ? { workspaceKey: workspace_key } : {}) },
+          dest_org_id,
+        ),
+      ),
+  );
+
+  writeTool(
+    "zoho_create_similar_views",
+    {
+      description: "Create views similar to a reference view, based over another table (e.g. replicate a report over a new table).",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_id: ID("Base table id for the new views."),
+        reference_view_id: ID("View to replicate."),
+        folder_id: ID("Folder to place the new views in."),
+        copy_custom_formula: z.boolean().optional(),
+        copy_agg_formula: z.boolean().optional(),
+      },
+      annotations: { title: "Create similar views", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, reference_view_id, folder_id, copy_custom_formula, copy_agg_formula }) =>
+      run(() =>
+        client.createSimilarViews(workspace_id, view_id, {
+          referenceViewId: reference_view_id,
+          folderId: folder_id,
+          ...(copy_custom_formula != null ? { copyCustomFormula: copy_custom_formula } : {}),
+          ...(copy_agg_formula != null ? { copyAggFormula: copy_agg_formula } : {}),
+        }),
+      ),
+  );
+
+  writeTool(
+    "zoho_auto_analyse",
+    {
+      description: "Auto-generate reports for a table — or, when column_id is given, for one column (Zoho's auto-analysis).",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("Table id."), column_id: z.string().optional().describe("Analyse just this column.") },
+      annotations: { title: "Auto analyse", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, column_id }) =>
+      run(() => (column_id ? client.autoAnalyseColumn(workspace_id, view_id, column_id) : client.autoAnalyseView(workspace_id, view_id))),
+  );
+
+  // ============================ Folder placement ============================
+
+  writeTool(
+    "zoho_make_default_folder",
+    {
+      description: "Make a folder the workspace's default folder (where new views land).",
+      inputSchema: { workspace_id: ID("Workspace id."), folder_id: ID("Folder id.") },
+      annotations: { title: "Make default folder", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, folder_id }) => run(() => client.makeDefaultFolder(workspace_id, folder_id)),
+  );
+
+  writeTool(
+    "zoho_move_folder",
+    {
+      description: "Change a folder's hierarchy: hierarchy 0 = make it a top-level (parent) folder, 1 = make it a child of parent_folder_id.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        folder_id: ID("Folder id."),
+        hierarchy: z.number().int().min(0).max(1).describe("0 = parent (top-level), 1 = child."),
+        parent_folder_id: z.string().optional().describe("Required when hierarchy=1."),
+      },
+      annotations: { title: "Move folder", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, folder_id, hierarchy, parent_folder_id }) => {
+      if (hierarchy === 1 && !parent_folder_id) return fail("parent_folder_id is required when hierarchy=1 (move as child).");
+      return run(() => client.moveFolder(workspace_id, folder_id, { hierarchy, ...(parent_folder_id ? { parentFolderId: parent_folder_id } : {}) }));
+    },
+  );
+
+  writeTool(
+    "zoho_reorder_folder",
+    {
+      description: "Reposition a folder relative to another folder (placed after the reference folder).",
+      inputSchema: { workspace_id: ID("Workspace id."), folder_id: ID("Folder id."), reference_folder_id: ID("Folder used as the position reference.") },
+      annotations: { title: "Reorder folder", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, folder_id, reference_folder_id }) =>
+      run(() => client.reorderFolder(workspace_id, folder_id, { referenceFolderId: reference_folder_id })),
+  );
+
+  // ============================ Favorites, default workspace & domain access ============================
+
+  writeTool(
+    "zoho_set_favorite_workspace",
+    {
+      description: "Mark or unmark a workspace as a favorite.",
+      inputSchema: { workspace_id: ID("Workspace id."), favorite: z.boolean().describe("true = add favorite, false = remove.") },
+      annotations: { title: "Set favorite workspace", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, favorite }) => run(() => client.setFavoriteWorkspace(workspace_id, favorite)),
+  );
+
+  writeTool(
+    "zoho_set_favorite_view",
+    {
+      description: "Mark or unmark a view as a favorite.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), favorite: z.boolean().describe("true = add favorite, false = remove.") },
+      annotations: { title: "Set favorite view", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, favorite }) => run(() => client.setFavoriteView(workspace_id, view_id, favorite)),
+  );
+
+  writeTool(
+    "zoho_set_default_workspace",
+    {
+      description: "Set or unset a workspace as your default workspace.",
+      inputSchema: { workspace_id: ID("Workspace id."), is_default: z.boolean().describe("true = make default, false = remove default.") },
+      annotations: { title: "Set default workspace", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, is_default }) => run(() => client.setDefaultWorkspace(workspace_id, is_default)),
+  );
+
+  writeTool(
+    "zoho_set_workspace_domain_access",
+    {
+      description: "Enable or disable white-label (custom domain) access for a workspace.",
+      inputSchema: { workspace_id: ID("Workspace id."), enabled: z.boolean() },
+      annotations: { title: "Set workspace domain access", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, enabled }) => run(() => client.setWorkspaceDomainAccess(workspace_id, enabled)),
+  );
+
+  // ============================ Data sources & sync ============================
+
+  writeTool(
+    "zoho_sync_datasource",
+    {
+      description:
+        "Trigger an on-demand data sync for a datasource (get datasource ids from zoho_list_datasources). Note: Zoho's spec and SDK disagree on this path segment (datasource vs datasources); implemented per the official OpenAPI spec.",
+      inputSchema: { workspace_id: ID("Workspace id."), datasource_id: ID("Datasource id.") },
+      annotations: { title: "Sync datasource", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, datasource_id }) => run(() => client.syncDatasource(workspace_id, datasource_id)),
+  );
+
+  writeTool(
+    "zoho_update_datasource_connection",
+    {
+      description: "Update a datasource's connection configuration (the config object is connector-specific; see Zoho's datasource docs).",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        datasource_id: ID("Datasource id."),
+        connection_config: z.record(z.string(), z.unknown()).describe("Connector-specific connection settings."),
+      },
+      annotations: { title: "Update datasource connection", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, datasource_id, connection_config }) =>
+      run(() => client.updateDatasourceConnection(workspace_id, datasource_id, connection_config)),
+  );
+
+  writeTool(
+    "zoho_refetch_view_data",
+    {
+      description: "Re-fetch a view's data from its original source (re-sync one view).",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id.") },
+      annotations: { title: "Refetch view data", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id }) => run(() => client.refetchViewData(workspace_id, view_id)),
+  );
+
+  // ============================ Email schedules ============================
+
+  server.registerTool(
+    "zoho_list_email_schedules",
+    {
+      description: "List the scheduled email exports configured in a workspace.",
+      inputSchema: { workspace_id: ID("Workspace id.") },
+      annotations: { title: "List email schedules", ...READ_ONLY },
+    },
+    async ({ workspace_id }) => run(() => client.getEmailSchedules(workspace_id)),
+  );
+
+  writeTool(
+    "zoho_create_email_schedule",
+    {
+      description:
+        "Create a scheduled email export of views. schedule_details: { calendarFrequency: daily|weekly|monthly|yearly, hour (0-23), minute (0,5,...,55), weekDays?/monthDays?/months? }. export_type: csv|xls|img|pdf|html. Sends recurring real emails once active.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_id: ID("View id the schedule is created under."),
+        schedule_name: z.string(),
+        view_ids: z.array(z.string()).min(1).describe("Views to include in the emailed export."),
+        export_type: z.enum(["csv", "xls", "img", "pdf", "html"]),
+        schedule_details: z.record(z.string(), z.unknown()).describe("{ calendarFrequency, hour, minute, ... }."),
+        email_ids: z.array(z.string()).optional().describe("Recipients."),
+        subject: z.string().optional(),
+        message: z.string().optional(),
+        options: advOpt,
+      },
+      annotations: { title: "Create email schedule", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, schedule_name, view_ids, export_type, schedule_details, email_ids, subject, message, options }) => {
+      audit("create_email_schedule", { workspace_id, schedule_name, views: view_ids.length });
+      return run(() =>
+        client.createEmailSchedule(
+          workspace_id,
+          view_id,
+          adv(
+            {
+              scheduleName: schedule_name,
+              viewIds: view_ids,
+              exportType: export_type,
+              scheduleDetails: schedule_details,
+              ...(email_ids ? { emailIds: email_ids } : {}),
+              ...(subject ? { subject } : {}),
+              ...(message ? { message } : {}),
+            },
+            options,
+          ),
+        ),
+      );
+    },
+  );
+
+  writeTool(
+    "zoho_update_email_schedule",
+    {
+      description: "Update an email schedule. Pass the fields to change via options (scheduleName, viewIds, exportType, scheduleDetails, emailIds, ...).",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_id: ID("View id."),
+        schedule_id: ID("Schedule id."),
+        options: z.record(z.string(), z.unknown()).describe("Schedule fields to set."),
+      },
+      annotations: { title: "Update email schedule", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, schedule_id, options }) =>
+      run(() => client.updateEmailSchedule(workspace_id, view_id, schedule_id, options)),
+  );
+
+  writeTool(
+    "zoho_delete_email_schedule",
+    {
+      description: "Delete an email schedule.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), schedule_id: ID("Schedule id."), dry_run: z.boolean().optional() },
+      annotations: { title: "Delete email schedule", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, schedule_id, dry_run }) => {
+      if (dry_run) return ok({ dry_run: true, action: "delete_email_schedule", schedule_id, note: "Nothing was deleted." });
+      audit("delete_email_schedule", { workspace_id, schedule_id });
+      return run(() => client.deleteEmailSchedule(workspace_id, view_id, schedule_id));
+    },
+  );
+
+  writeTool(
+    "zoho_trigger_email_schedule",
+    {
+      description: "Send a scheduled email NOW (out of schedule). Sends real email each call — dry_run previews.",
+      inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), schedule_id: ID("Schedule id."), dry_run: z.boolean().optional() },
+      annotations: { title: "Trigger email schedule", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, schedule_id, dry_run }) => {
+      if (dry_run) return ok({ dry_run: true, action: "trigger_email_schedule", schedule_id, note: "Would send the scheduled email now. Nothing was sent." });
+      audit("trigger_email_schedule", { workspace_id, schedule_id });
+      return run(() => client.triggerEmailSchedule(workspace_id, view_id, schedule_id));
+    },
+  );
+
+  writeTool(
+    "zoho_set_email_schedule_status",
+    {
+      description: "Activate or deactivate an email schedule.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        view_id: ID("View id."),
+        schedule_id: ID("Schedule id."),
+        operation: z.enum(["activate", "deactivate"]),
+      },
+      annotations: { title: "Set email schedule status", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, view_id, schedule_id, operation }) =>
+      run(() => client.changeEmailScheduleStatus(workspace_id, view_id, schedule_id, { operation })),
+  );
+
+  // ============================ AutoML ============================
+
+  server.registerTool(
+    "zoho_list_automl_analysis",
+    {
+      description: "List AutoML analyses — across the org, or within one workspace when workspace_id is given.",
+      inputSchema: { workspace_id: z.string().optional().describe("Scope to one workspace.") },
+      annotations: { title: "List AutoML analyses", ...READ_ONLY },
+    },
+    async ({ workspace_id }) =>
+      run(() => (workspace_id ? client.getAutoMLAnalysisInWorkspace(workspace_id) : client.getAutoMLAnalysisOrg())),
+  );
+
+  server.registerTool(
+    "zoho_get_automl_analysis",
+    {
+      description: "Get the details of an AutoML analysis (models, status, metrics).",
+      inputSchema: { workspace_id: ID("Workspace id."), analysis_id: ID("Analysis id.") },
+      annotations: { title: "Get AutoML analysis", ...READ_ONLY },
+    },
+    async ({ workspace_id, analysis_id }) => run(() => client.getAutoMLAnalysisDetails(workspace_id, analysis_id)),
+  );
+
+  server.registerTool(
+    "zoho_list_automl_deployments",
+    {
+      description: "List the deployments of an AutoML model.",
+      inputSchema: { workspace_id: ID("Workspace id."), analysis_id: ID("Analysis id."), model_id: ID("Model id.") },
+      annotations: { title: "List AutoML deployments", ...READ_ONLY },
+    },
+    async ({ workspace_id, analysis_id, model_id }) => run(() => client.getAutoMLModelDeployments(workspace_id, analysis_id, model_id)),
+  );
+
+  writeTool(
+    "zoho_create_automl_analysis",
+    {
+      description:
+        "Create an AutoML analysis (trains models). prediction_type: REGRESSION | CLASSIFICATION | CLUSTERING. features = input column names; algorithms is the per-algorithm tuning object (see Zoho AutoML docs); server_option 1-3 picks server memory.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        name: z.string().describe("Analysis name."),
+        training_table_id: z.string().describe("Id of the training table."),
+        prediction_type: z.enum(["REGRESSION", "CLASSIFICATION", "CLUSTERING"]),
+        features: z.array(z.string()).min(1).describe("Input feature column names."),
+        algorithms: z.record(z.string(), z.unknown()).describe("Algorithm configuration object (e.g. { randomForestRegression: {...} })."),
+        server_option: z.number().int().min(1).max(3).describe("Server memory option (1-3)."),
+        target_column: z.string().optional().describe("Column to predict (required for regression/classification)."),
+        description: z.string().optional(),
+      },
+      annotations: { title: "Create AutoML analysis", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, name, training_table_id, prediction_type, features, algorithms, server_option, target_column, description }) => {
+      audit("create_automl_analysis", { workspace_id, name, prediction_type });
+      return run(() =>
+        client.createAutoMLAnalysis(workspace_id, {
+          name,
+          trainingTableId: Number(training_table_id),
+          predictionType: prediction_type,
+          features,
+          algorithms,
+          serverOption: server_option,
+          ...(target_column ? { targetColumn: target_column } : {}),
+          ...(description ? { description } : {}),
+        }),
+      );
+    },
+  );
+
+  writeTool(
+    "zoho_delete_automl_analysis",
+    {
+      description: "Delete an AutoML analysis (and its models). Irreversible.",
+      inputSchema: { workspace_id: ID("Workspace id."), analysis_id: ID("Analysis id."), dry_run: z.boolean().optional() },
+      annotations: { title: "Delete AutoML analysis", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, analysis_id, dry_run }) => {
+      if (dry_run) return ok({ dry_run: true, action: "delete_automl_analysis", analysis_id, note: "Nothing was deleted." });
+      audit("delete_automl_analysis", { workspace_id, analysis_id });
+      return run(() => client.deleteAutoMLAnalysis(workspace_id, analysis_id));
+    },
+  );
+
+  writeTool(
+    "zoho_delete_automl_model",
+    {
+      description: "Delete one model from an AutoML analysis. Irreversible.",
+      inputSchema: { workspace_id: ID("Workspace id."), analysis_id: ID("Analysis id."), model_id: ID("Model id."), dry_run: z.boolean().optional() },
+      annotations: { title: "Delete AutoML model", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, analysis_id, model_id, dry_run }) => {
+      if (dry_run) return ok({ dry_run: true, action: "delete_automl_model", model_id, note: "Nothing was deleted." });
+      audit("delete_automl_model", { workspace_id, analysis_id, model_id });
+      return run(() => client.deleteAutoMLModel(workspace_id, analysis_id, model_id));
+    },
+  );
+
+  writeTool(
+    "zoho_create_automl_deployment",
+    {
+      description:
+        "Deploy an AutoML model: reads input_table, writes predictions to output_table on a schedule. schedule_details: { calendarFrequency: none|hourly|daily|weekly|monthly, hour?, minute?, ... }. import_type: APPEND | TRUNCATEADD | UPDATEADD (UPDATEADD needs matching_columns).",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        analysis_id: ID("Analysis id."),
+        model_id: ID("Model id."),
+        input_table_id: z.string().describe("Table to read input rows from."),
+        output_table: z.string().describe("Table name to write predictions to."),
+        prediction_column: z.string().describe("Column name for the predictions."),
+        output_columns: z.array(z.string()).min(1).describe("Columns to carry into the output table."),
+        schedule_details: z.record(z.string(), z.unknown()).describe("{ calendarFrequency, hour?, minute?, ... }."),
+        import_type: z.enum(["APPEND", "TRUNCATEADD", "UPDATEADD"]),
+        server_option: z.number().int().min(1).max(3),
+        matching_columns: z.array(z.string()).optional().describe("Required when import_type=UPDATEADD."),
+        timezone: z.string().optional(),
+      },
+      annotations: { title: "Create AutoML deployment", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async (a) => {
+      if (a.import_type === "UPDATEADD" && !a.matching_columns?.length) {
+        return fail("matching_columns is required when import_type=UPDATEADD.");
+      }
+      audit("create_automl_deployment", { workspace_id: a.workspace_id, analysis_id: a.analysis_id, model_id: a.model_id });
+      return run(() =>
+        client.createAutoMLDeployment(a.workspace_id, a.analysis_id, a.model_id, {
+          inputTableId: Number(a.input_table_id),
+          outputTable: a.output_table,
+          predictionColumn: a.prediction_column,
+          outputColumns: a.output_columns,
+          scheduleDetails: a.schedule_details,
+          importType: a.import_type,
+          serverOption: a.server_option,
+          ...(a.matching_columns ? { matchingColumns: a.matching_columns } : {}),
+          ...(a.timezone ? { timezone: a.timezone } : {}),
+        }),
+      );
+    },
+  );
+
+  writeTool(
+    "zoho_delete_automl_deployment",
+    {
+      description: "Delete an AutoML model deployment. Irreversible.",
+      inputSchema: { workspace_id: ID("Workspace id."), analysis_id: ID("Analysis id."), deployment_id: ID("Deployment id."), dry_run: z.boolean().optional() },
+      annotations: { title: "Delete AutoML deployment", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, analysis_id, deployment_id, dry_run }) => {
+      if (dry_run) return ok({ dry_run: true, action: "delete_automl_deployment", deployment_id, note: "Nothing was deleted." });
+      audit("delete_automl_deployment", { workspace_id, analysis_id, deployment_id });
+      return run(() => client.deleteAutoMLDeployment(workspace_id, analysis_id, deployment_id));
+    },
+  );
+
+  writeTool(
+    "zoho_run_automl_deployment",
+    {
+      description: "Run an AutoML deployment NOW (out of schedule) — generates predictions into the output table.",
+      inputSchema: { workspace_id: ID("Workspace id."), analysis_id: ID("Analysis id."), deployment_id: ID("Deployment id.") },
+      annotations: { title: "Run AutoML deployment", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, analysis_id, deployment_id }) => {
+      audit("run_automl_deployment", { workspace_id, analysis_id, deployment_id });
+      return run(() => client.runAutoMLDeployment(workspace_id, analysis_id, deployment_id));
+    },
+  );
+
+  server.registerTool(
+    "zoho_automl_whatif",
+    {
+      description: "What-if analysis: feed a model one set of feature values and get its prediction. features = { columnName: value, ... }.",
+      inputSchema: {
+        workspace_id: ID("Workspace id."),
+        analysis_id: ID("Analysis id."),
+        model_id: ID("Model id."),
+        features: z.record(z.string(), cellValue).describe("Feature inputs, e.g. { \"Age\": 42, \"Region\": \"East\" }."),
+      },
+      annotations: { title: "AutoML what-if", readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, analysis_id, model_id, features }) =>
+      run(() => client.autoMLWhatIf(workspace_id, analysis_id, model_id, { features })),
   );
 }

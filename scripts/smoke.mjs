@@ -90,8 +90,8 @@ const tools = list.body?.result?.tools ?? [];
 // Detect a read-only (MCP_READONLY=true) deployment by the absence of write tools.
 const readonly = !WRITE_TOOLS.some((t) => tools.some((x) => x.name === t));
 if (readonly) console.log("note: read-only deployment detected — skipping write-tool checks");
-// Full deploy registers ~102 tools; MCP_READONLY trims to ~36 reads.
-check("tools/list", tools.length >= (readonly ? 30 : 90), `(${tools.length} tools)`);
+// Full deploy registers ~140 tools; MCP_READONLY trims to ~48 reads.
+check("tools/list", tools.length >= (readonly ? 40 : 130), `(${tools.length} tools)`);
 for (const t of READ_TOOLS) check(`tool present: ${t}`, tools.some((x) => x.name === t));
 if (!readonly) for (const t of WRITE_TOOLS) check(`tool present: ${t}`, tools.some((x) => x.name === t));
 

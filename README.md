@@ -2,7 +2,7 @@
 
 The [Zoho Analytics](https://www.zoho.com/analytics/) [API v2](https://www.zoho.com/analytics/api/v2/introduction.html) exposed as a **remote [MCP](https://modelcontextprotocol.io) server**, running as a **Cloudflare Worker** (Streamable HTTP + SSE). Built on the [`agents`](https://github.com/cloudflare/agents) `McpAgent`.
 
-It exposes **100+ tools spanning the full Zoho Analytics v2 API** — discovery & metadata, the Data API, the async Bulk API, modeling (tables, query tables, reports, columns, lookups, formulas, folders, view lifecycle), workspace administration, sharing & collaboration (groups, admins), user management, publishing & embedding (URLs, slideshows), and variables — plus conveniences the raw API lacks: a one-call **workspace schema map**, an end-to-end **SQL-query helper** that drives the async export job for you, bounded-concurrency batch reads, bounded job polling, and `dry_run` previews on destructive operations. The tool definitions live in [`src/tools.ts`](src/tools.ts) and the Zoho Analytics REST client in [`src/zohoanalytics.ts`](src/zohoanalytics.ts); both are transport-agnostic, so every build shares an identical tool surface. Set `MCP_READONLY=true` to register only the ~36 read tools.
+It exposes **140 tools covering ALL 161 endpoints of the Zoho Analytics v2 API** (verified against Zoho's [official OpenAPI specs](https://github.com/zoho/analytics-oas)) — discovery & metadata, the Data API, the sync/async/batch Bulk API, modeling (tables, query tables, reports, columns, lookups, formulas, folders, view lifecycle, dependents), workspace administration, sharing & collaboration (groups, admins), user management, publishing & embedding (URLs, slideshows), email schedules, variables, favorites, data-source sync, template export, and **AutoML** — plus conveniences the raw API lacks: a one-call **workspace schema map**, an end-to-end **SQL-query helper** that drives the async export job for you, bounded-concurrency batch reads, bounded job polling, and `dry_run` previews on destructive operations. The tool definitions live in [`src/tools.ts`](src/tools.ts) and the Zoho Analytics REST client in [`src/zohoanalytics.ts`](src/zohoanalytics.ts); both are transport-agnostic, so every build shares an identical tool surface. Set `MCP_READONLY=true` to register only the ~48 read tools.
 
 This repo ships **two deployments from the same code**:
 
@@ -165,6 +165,22 @@ Org: `zoho_list_users`, `zoho_add_users`, `zoho_remove_users`, `zoho_set_users_s
 
 `zoho_list_variables`, `zoho_create_variable`, `zoho_update_variable`, `zoho_delete_variable`.
 
+### Dependents, formulas & analysis
+
+Reads: `zoho_get_dependents` (view/column), `zoho_list_formula_columns`, `zoho_list_aggregate_formulas`, `zoho_get_aggregate_formula_value`, `zoho_get_aggregate_formula_dependents`, `zoho_get_last_import_details`, `zoho_export_workspace_template` (base64 ZIP). Writes: `zoho_edit_formula_column`, `zoho_edit_aggregate_formula`, `zoho_copy_formulas` (cross-workspace/org), `zoho_create_similar_views`, `zoho_auto_analyse` (view or column), folder placement (`zoho_make_default_folder`, `zoho_move_folder`, `zoho_reorder_folder`).
+
+### Favorites, defaults & data sources
+
+`zoho_set_favorite_workspace`, `zoho_set_favorite_view`, `zoho_set_default_workspace`, `zoho_set_workspace_domain_access` (white-label), `zoho_sync_datasource`, `zoho_update_datasource_connection`, `zoho_refetch_view_data`.
+
+### Email schedules
+
+`zoho_list_email_schedules`, `zoho_create_email_schedule`, `zoho_update_email_schedule`, `zoho_delete_email_schedule`, `zoho_trigger_email_schedule` (sends real email; `dry_run`), `zoho_set_email_schedule_status`.
+
+### AutoML
+
+Reads: `zoho_list_automl_analysis` (org/workspace), `zoho_get_automl_analysis`, `zoho_list_automl_deployments`, `zoho_automl_whatif` (prediction for one input). Writes: `zoho_create_automl_analysis` (train models — REGRESSION/CLASSIFICATION/CLUSTERING), `zoho_create_automl_deployment`, `zoho_run_automl_deployment`, and deletes for analysis/model/deployment (all with `dry_run`).
+
 ### Operational modes
 
 - **Read-only deploys.** Set `MCP_READONLY=true` for a reporting/dashboard connector — only the discovery, query, and read tools are registered.
@@ -198,9 +214,9 @@ The tools map onto these Zoho Analytics v2 endpoints (relative to `https://<api-
 | `zoho_create_table` | `POST /workspaces/{workspace-id}/tables` |
 | `zoho_delete_view` | `DELETE /workspaces/{workspace-id}/views/{view-id}` |
 
-The table above lists the core data/metadata endpoints; **v1.1 adds the rest of the v2 surface** — modeling (`/querytables`, `/reports`, `/views/{id}/columns`, `/customformulas`, `/aggregateformulas`, `/folders`, `/views/{id}/saveas`, `/trash/{id}`, …), workspace admin (`/secretkey`, copy/rename/delete, `/views/copy`), sharing (`/views/share`, `/groups`, `/admins`, `/orgadmins`), user management (`/users`, `/users/role`, `/subscription`, `/resources`, `/workspaces/{id}/users`), publishing/embed (`/publish`, `/publish/embed`, `/publish/privatelink`, `/publish/public`, `/slides`), and `/variables` — see the matching tool categories above and the `ZohoAnalyticsClient` methods in [`src/zohoanalytics.ts`](src/zohoanalytics.ts).
+The table above lists the core data/metadata endpoints; the rest of the v2 surface is covered too — modeling (`/querytables`, `/reports`, `/views/{id}/columns`, `/customformulas`, `/aggregateformulas`, `/folders`, `/views/{id}/saveas`, `/trash/{id}`, `/similarviews`, `/autoanalyse`, …), workspace admin (`/secretkey`, copy/rename/delete, `/views/copy`, `/template/data`, favorites/default/`/wlaccess`), sharing (`/views/share`, `/groups`, `/admins`, `/orgadmins`), user management (`/users`, `/users/role`, `/subscription`, `/resources`, `/workspaces/{id}/users`), publishing/embed (`/publish`, `/publish/embed`, `/publish/privatelink`, `/publish/public`, `/slides`), email schedules (`/emailschedules` CRUD + trigger), data sources (`/datasources`, `/datasource/{id}/sync`), `/variables`, and AutoML (`/automl/...` analysis, models, deployments, what-if) — see the matching tool categories above and the `ZohoAnalyticsClient` methods in [`src/zohoanalytics.ts`](src/zohoanalytics.ts).
 
-**Still intentionally omitted:** the **AutoML** APIs (predictive analysis / model deployment — a large separate subsystem) and **email-schedule** management. To add either, add a method to `ZohoAnalyticsClient` and a tool in `registerTools()`. Full API: <https://www.zoho.com/analytics/api/v2/introduction.html> · specs: <https://github.com/zoho/analytics-oas>.
+**Coverage: 161/161 endpoints** across Zoho's seven published OpenAPI spec files (data, bulk, metadata, modeling, share, user-management, embed), verified by diffing every spec `(method, path)` pair against the client. Full API: <https://www.zoho.com/analytics/api/v2/introduction.html> · specs: <https://github.com/zoho/analytics-oas>.
 
 ---
 
@@ -397,9 +413,9 @@ npx wrangler deploy -c wrangler.oauth.jsonc
 - **Bring your own OAuth app.** You need a registered Zoho client and a refresh token (see [Getting Zoho OAuth credentials](#getting-zoho-oauth-credentials)). `ZOHO_DC` must match the data center your account lives in, or token refresh fails.
 - **Ad-hoc SQL is async.** Zoho runs ad-hoc SQL through a bulk export *job*. `zoho_query_data` hides this (create → poll → download) but bounds its wait (default 30s, cap 60s); for very large result sets it returns a `job_id` to poll with `zoho_get_export_job`.
 - **API units & frequency limits.** Calls consume daily API units and are subject to per-minute frequency limits (≈100 req/min overall). Batch tools use bounded concurrency, but heavy use can still hit quota errors (`6043`/`6044`/`6045`).
-- **Large tool surface.** Full coverage means ~102 tools. That's a lot for one connector — if your client struggles with the count or you only need reporting, deploy with `MCP_READONLY=true` for the ~36 read tools. Advanced/long-tail CONFIG keys on the modeling, sharing, publish, and variable tools are passed through an `options` object (documented per tool) rather than enumerated as parameters.
+- **Large tool surface.** Full coverage means ~140 tools. That's a lot for one connector — if your client struggles with the count or you only need reporting, deploy with `MCP_READONLY=true` for the ~48 read tools. Advanced/long-tail CONFIG keys on the modeling, sharing, publish, and variable tools are passed through an `options` object (documented per tool) rather than enumerated as parameters.
 - **Single-user OAuth.** The OAuth worker gates on one shared passphrase — fine for a personal connector, not multi-tenant. Swap the consent handler for a real IdP if you need per-user identity.
-- **Spec ambiguities.** A handful of Zoho endpoints are inconsistent across their docs/OpenAPI specs/SDK (e.g. the data-sync path's singular vs. plural segment, `get_my_permissions` path, secret-key `regenerateKey`). These were implemented to the OpenAPI specs; verify the niche ones against a live call. AutoML and email-schedule APIs are not exposed.
+- **Spec ambiguities.** A handful of Zoho endpoints are inconsistent across their docs/OpenAPI specs/SDK (e.g. the data-sync path's singular vs. plural segment, `get_my_permissions` path, secret-key `regenerateKey`). These were implemented to the OpenAPI specs; verify the niche ones against a live call.
 - **Dependency versions.** `agents@^0.14.5` + `@modelcontextprotocol/sdk@^1.29.0` + `zod@^4`; `npm audit` is clean. `ai`/`react` are required peers of `agents` (npm auto-installs them) but nothing on the `agents/mcp` server path imports them, so they never enter the Worker bundle.
 
 ---

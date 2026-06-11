@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.2.0 — 100% endpoint coverage (161/161)
+
+A spec-diff audit (every `(method, path)` pair in Zoho's seven official OpenAPI files vs. the
+client) found 52 unimplemented endpoints; all are now covered — coverage is **161/161**.
+
+### Added
+- **AutoML** (12 endpoints / 10 tools): list/get analyses, create analysis (train
+  REGRESSION/CLASSIFICATION/CLUSTERING models), model deployments (create/list/run/delete),
+  what-if predictions, deletes with `dry_run`.
+- **Email schedules** (6/6): list, create, update, delete, trigger-now (`dry_run`),
+  activate/deactivate.
+- **Sync & batch imports** (4): `mode: async | sync | batch` on `zoho_import_data` and
+  `zoho_create_table_from_data` (synchronous inline import and chunked batch jobs).
+- **Dependents & formula reads** (8): view/column dependents, custom & aggregate formula lists,
+  aggregate formula value + dependents, last-import details.
+- **Formula/view modeling** (6): edit formula column, edit aggregate formula, copy formulas
+  cross-workspace/org, create similar views, auto-analyse view/column.
+- **Folder placement** (3): make default, change hierarchy, reorder.
+- **Favorites & workspace flags** (8): favorite workspace/view, default workspace, white-label
+  domain access (each a single set-style tool).
+- **Data sources** (3): sync datasource, update connection config, refetch view data.
+- **Template export** (1): `zoho_export_workspace_template` — binary ZIP returned base64
+  (new binary read path in the client).
+- **Dashboards** scope param (owned/shared/all → 2 endpoints).
+- 4 new tests (sync-import path, base64 template export, POST/DELETE favorite toggle, AutoML
+  paths) — **44 total**.
+
+Tool surface: **140 tools** (48 read / 92 write).
+
 ## 1.1.1 — Hardening pass (adversarial review)
 
 A multi-agent review against Zoho's docs/OpenAPI specs surfaced 18 confirmed issues; all fixed.

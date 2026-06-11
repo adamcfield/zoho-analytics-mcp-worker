@@ -294,6 +294,42 @@ describe("mapLimit", () => {
   });
 });
 
+describe("full-coverage additions", () => {
+  it("sync import posts multipart to the non-bulk path with CONFIG in the query", async () => {
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 }));
+    vi.stubGlobal("fetch", f);
+    await mkStatic().importDataSync("WS", "V", { content: "a\n1", name: "i.csv" }, { importType: "append" });
+    const [url, init] = f.mock.calls[0];
+    expect(String(url)).toContain("/restapi/v2/workspaces/WS/views/V/data?");
+    expect(String(url)).not.toContain("/bulk/");
+    expect(String(url)).toContain("CONFIG=");
+    expect(init?.body instanceof FormData).toBe(true);
+  });
+
+  it("favorite toggles map to POST (add) and DELETE (remove)", async () => {
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", f);
+    const c = mkStatic();
+    await c.setFavoriteView("W", "V", true);
+    await c.setFavoriteView("W", "V", false);
+    expect(String(f.mock.calls[0][0])).toContain("/workspaces/W/views/V/favorite");
+    expect(f.mock.calls[0][1]?.method).toBe("POST");
+    expect(f.mock.calls[1][1]?.method).toBe("DELETE");
+  });
+
+  it("template export returns the body base64-encoded", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (..._args: FetchArgs) => new Response("ZIPBYTES", { status: 200 })));
+    expect(await mkStatic().exportAsTemplate("W", ["v1"])).toBe(btoa("ZIPBYTES"));
+  });
+
+  it("builds AutoML paths correctly", async () => {
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 }));
+    vi.stubGlobal("fetch", f);
+    await mkStatic().runAutoMLDeployment("W", "A", "D");
+    expect(String(f.mock.calls[0][0])).toContain("/automl/workspaces/W/analysis/A/deployments/D/execute");
+  });
+});
+
 describe("ZohoAnalyticsError", () => {
   it("includes method, path, status and errorCode in the message", () => {
     const e = new ZohoAnalyticsError(404, 7103, "not found", "GET", "/workspaces/x");

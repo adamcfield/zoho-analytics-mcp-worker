@@ -139,6 +139,19 @@ interface CoreOptions {
   form?: FormData;
   /** Extra request headers (e.g. ZANALYTICS-DEST-ORGID for cross-org copies). */
   headers?: Record<string, string>;
+  /** Read the response as binary and return it base64-encoded (template export ZIPs). */
+  binary?: boolean;
+}
+
+/** Base64-encode an ArrayBuffer in chunks (btoa exists in Workers and Node >= 16). */
+function b64encode(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
 }
 
 export class ZohoAnalyticsClient {
@@ -329,7 +342,10 @@ export class ZohoAnalyticsClient {
       try {
         const res = await fetch(url, { method, headers, body, signal: controller.signal });
         clearTimeout(timer);
-        const text = await res.text();
+        // Binary reads only apply to OK responses; error bodies stay text so the
+        // failure envelope can be parsed. (A failure envelope on HTTP 200 would be
+        // base64'd and missed — acceptable for the one binary endpoint, template export.)
+        const text = opts.binary && res.ok ? b64encode(await res.arrayBuffer()) : await res.text();
 
         // The token may have been revoked/expired server-side before our cached
         // expiry. Refresh once and retry immediately.
@@ -848,5 +864,203 @@ export class ZohoAnalyticsClient {
   }
   deleteVariable(workspaceId: string, variableId: string) {
     return this.request("DELETE", `/workspaces/${workspaceId}/variables/${variableId}`);
+  }
+
+  // ============================ Synchronous & batch imports ============================
+
+  private importForm(file: { content: string; name: string; type?: string }): FormData {
+    const form = new FormData();
+    form.append("FILE", new Blob([file.content], { type: file.type ?? "text/csv" }), file.name);
+    return form;
+  }
+  /** Synchronous import into an EXISTING table (returns the import result inline, no job). */
+  importDataSync(workspaceId: string, viewId: string, file: { content: string; name: string; type?: string }, config: Config) {
+    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/data`, { config, form: this.importForm(file) });
+  }
+  /** Synchronous import that CREATES a new table. config: { tableName, fileType, autoIdentify, ... }. */
+  importDataSyncNewTable(workspaceId: string, file: { content: string; name: string; type?: string }, config: Config) {
+    return this.request("POST", `/workspaces/${workspaceId}/data`, { config, form: this.importForm(file) });
+  }
+  /** Batch import (chunked upload) into an existing table — async job. */
+  createBatchImportJob(workspaceId: string, viewId: string, file: { content: string; name: string; type?: string }, config: Config) {
+    return this.request("POST", `/bulk/workspaces/${workspaceId}/views/${viewId}/data/batch`, { config, form: this.importForm(file) });
+  }
+  /** Batch import (chunked upload) creating a new table — async job. */
+  createBatchImportJobNewTable(workspaceId: string, file: { content: string; name: string; type?: string }, config: Config) {
+    return this.request("POST", `/bulk/workspaces/${workspaceId}/data/batch`, { config, form: this.importForm(file) });
+  }
+
+  // ============================ Metadata: dashboards / dependents / formulas (reads) ============================
+
+  getOwnedDashboards() {
+    return this.request("GET", "/dashboards/owned");
+  }
+  getSharedDashboards() {
+    return this.request("GET", "/dashboards/shared");
+  }
+  getViewDependents(workspaceId: string, viewId: string) {
+    return this.request("GET", `/workspaces/${workspaceId}/views/${viewId}/dependents`);
+  }
+  getColumnDependents(workspaceId: string, viewId: string, columnId: string) {
+    return this.request("GET", `/workspaces/${workspaceId}/views/${viewId}/columns/${columnId}/dependents`);
+  }
+  getCustomFormulas(workspaceId: string, viewId: string) {
+    return this.request("GET", `/workspaces/${workspaceId}/views/${viewId}/customformulas`);
+  }
+  getViewAggregateFormulas(workspaceId: string, viewId: string) {
+    return this.request("GET", `/workspaces/${workspaceId}/views/${viewId}/aggregateformulas`);
+  }
+  getWorkspaceAggregateFormulas(workspaceId: string) {
+    return this.request("GET", `/workspaces/${workspaceId}/aggregateformulas`);
+  }
+  getAggregateFormulaDependents(workspaceId: string, formulaId: string) {
+    return this.request("GET", `/workspaces/${workspaceId}/aggregateformulas/${formulaId}/dependents`);
+  }
+  /** Evaluate an aggregate formula and return its current value. */
+  getAggregateFormulaValue(workspaceId: string, formulaId: string) {
+    return this.request("GET", `/workspaces/${workspaceId}/aggregateformulas/${formulaId}/value`);
+  }
+  getLastImportDetails(workspaceId: string, viewId: string) {
+    return this.request("GET", `/workspaces/${workspaceId}/views/${viewId}/importdetails`);
+  }
+  /** Export selected views as a reusable template ZIP, returned base64-encoded. */
+  exportAsTemplate(workspaceId: string, viewIds: string[]): Promise<string> {
+    return this.requestRaw("GET", `/workspaces/${workspaceId}/template/data`, { config: { viewIds }, binary: true });
+  }
+
+  // ============================ Metadata: favorites / default / domain access ============================
+
+  setFavoriteWorkspace(workspaceId: string, favorite: boolean) {
+    return this.request(favorite ? "POST" : "DELETE", `/workspaces/${workspaceId}/favorite`);
+  }
+  setFavoriteView(workspaceId: string, viewId: string, favorite: boolean) {
+    return this.request(favorite ? "POST" : "DELETE", `/workspaces/${workspaceId}/views/${viewId}/favorite`);
+  }
+  setDefaultWorkspace(workspaceId: string, isDefault: boolean) {
+    return this.request(isDefault ? "POST" : "DELETE", `/workspaces/${workspaceId}/default`);
+  }
+  /** Enable/disable white-label (custom domain) access for a workspace. */
+  setWorkspaceDomainAccess(workspaceId: string, enabled: boolean) {
+    return this.request(enabled ? "POST" : "DELETE", `/workspaces/${workspaceId}/wlaccess`);
+  }
+
+  // ============================ Data sources & sync ============================
+
+  /** Trigger a data sync for a datasource. (Path per Zoho's OAS; their SDK uses plural "datasources" — verify live.) */
+  syncDatasource(workspaceId: string, datasourceId: string) {
+    return this.request("POST", `/workspaces/${workspaceId}/datasource/${datasourceId}/sync`);
+  }
+  /** Update a datasource's connection config (opaque JSON per Zoho's spec). */
+  updateDatasourceConnection(workspaceId: string, datasourceId: string, config: Config) {
+    return this.request("PUT", `/workspaces/${workspaceId}/datasource/${datasourceId}`, { config });
+  }
+  /** Re-fetch a view's data from its source. */
+  refetchViewData(workspaceId: string, viewId: string) {
+    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/sync`);
+  }
+
+  // ============================ Modeling: folders / formulas / analysis ============================
+
+  makeDefaultFolder(workspaceId: string, folderId: string) {
+    return this.request("POST", `/workspaces/${workspaceId}/folders/${folderId}/default`);
+  }
+  /** Change folder hierarchy. config: { hierarchy (0=parent, 1=child), parentFolderId? }. */
+  moveFolder(workspaceId: string, folderId: string, config: Config) {
+    return this.request("PUT", `/workspaces/${workspaceId}/folders/${folderId}/move`, { config });
+  }
+  /** Reposition a folder. config: { referenceFolderId }. */
+  reorderFolder(workspaceId: string, folderId: string, config: Config) {
+    return this.request("PUT", `/workspaces/${workspaceId}/folders/${folderId}/reorder`, { config });
+  }
+  /** Copy formula columns to a matching table elsewhere. config: { formulaColumnNames, destWorkspaceId, workspaceKey? }. destOrgId required. */
+  copyFormulas(workspaceId: string, viewId: string, config: Config, destOrgId: string) {
+    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/formulas/copy`, {
+      config,
+      headers: { "ZANALYTICS-DEST-ORGID": destOrgId },
+    });
+  }
+  /** Create views similar to a reference view. config: { referenceViewId, folderId, copyCustomFormula?, copyAggFormula? }. */
+  createSimilarViews(workspaceId: string, viewId: string, config: Config) {
+    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/similarviews`, { config });
+  }
+  /** Auto-generate reports for a view. */
+  autoAnalyseView(workspaceId: string, viewId: string) {
+    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/autoanalyse`);
+  }
+  /** Auto-generate reports for a single column. */
+  autoAnalyseColumn(workspaceId: string, viewId: string, columnId: string) {
+    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/columns/${columnId}/autoanalyse`);
+  }
+  /** Edit a formula column. config: { expression, description? }. */
+  editFormulaColumn(workspaceId: string, viewId: string, formulaId: string, config: Config) {
+    return this.request("PUT", `/workspaces/${workspaceId}/views/${viewId}/customformulas/${formulaId}`, { config });
+  }
+  /** Edit an aggregate formula. config: { expression, description? }. */
+  editAggregateFormula(workspaceId: string, viewId: string, formulaId: string, config: Config) {
+    return this.request("PUT", `/workspaces/${workspaceId}/views/${viewId}/aggregateformulas/${formulaId}`, { config });
+  }
+
+  // ============================ Email schedules ============================
+
+  getEmailSchedules(workspaceId: string) {
+    return this.request("GET", `/workspaces/${workspaceId}/emailschedules`);
+  }
+  /** config: { scheduleName, viewIds, exportType, scheduleDetails:{calendarFrequency,hour,minute,...}, emailIds?, ... }. */
+  createEmailSchedule(workspaceId: string, viewId: string, config: Config) {
+    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/emailschedules`, { config });
+  }
+  updateEmailSchedule(workspaceId: string, viewId: string, scheduleId: string, config: Config) {
+    return this.request("PUT", `/workspaces/${workspaceId}/views/${viewId}/emailschedules/${scheduleId}`, { config });
+  }
+  deleteEmailSchedule(workspaceId: string, viewId: string, scheduleId: string) {
+    return this.request("DELETE", `/workspaces/${workspaceId}/views/${viewId}/emailschedules/${scheduleId}`);
+  }
+  /** Send the scheduled email immediately. */
+  triggerEmailSchedule(workspaceId: string, viewId: string, scheduleId: string) {
+    return this.request("POST", `/workspaces/${workspaceId}/views/${viewId}/emailschedules/${scheduleId}/trigger`);
+  }
+  /** config: { operation: "activate" | "deactivate" }. */
+  changeEmailScheduleStatus(workspaceId: string, viewId: string, scheduleId: string, config: Config) {
+    return this.request("PUT", `/workspaces/${workspaceId}/views/${viewId}/emailschedules/${scheduleId}/status`, { config });
+  }
+
+  // ============================ AutoML ============================
+
+  getAutoMLAnalysisOrg() {
+    return this.request("GET", "/automl/analysis");
+  }
+  getAutoMLAnalysisInWorkspace(workspaceId: string) {
+    return this.request("GET", `/automl/workspaces/${workspaceId}/analysis`);
+  }
+  getAutoMLAnalysisDetails(workspaceId: string, analysisId: string) {
+    return this.request("GET", `/automl/workspaces/${workspaceId}/analysis/${analysisId}`);
+  }
+  getAutoMLModelDeployments(workspaceId: string, analysisId: string, modelId: string) {
+    return this.request("GET", `/automl/workspaces/${workspaceId}/analysis/${analysisId}/models/${modelId}/deployments`);
+  }
+  /** config: { name, trainingTableId, predictionType (REGRESSION|CLASSIFICATION|CLUSTERING), features, serverOption, algorithms, targetColumn?, ... }. */
+  createAutoMLAnalysis(workspaceId: string, config: Config) {
+    return this.request("POST", `/automl/workspaces/${workspaceId}/analysis`, { config });
+  }
+  deleteAutoMLAnalysis(workspaceId: string, analysisId: string) {
+    return this.request("DELETE", `/automl/workspaces/${workspaceId}/analysis/${analysisId}`);
+  }
+  deleteAutoMLModel(workspaceId: string, analysisId: string, modelId: string) {
+    return this.request("DELETE", `/automl/workspaces/${workspaceId}/analysis/${analysisId}/models/${modelId}`);
+  }
+  /** config: { inputTableId, outputTable, scheduleDetails, outputColumns, predictionColumn, serverOption, importType, ... }. */
+  createAutoMLDeployment(workspaceId: string, analysisId: string, modelId: string, config: Config) {
+    return this.request("POST", `/automl/workspaces/${workspaceId}/analysis/${analysisId}/models/${modelId}/deployments`, { config });
+  }
+  deleteAutoMLDeployment(workspaceId: string, analysisId: string, deploymentId: string) {
+    return this.request("DELETE", `/automl/workspaces/${workspaceId}/analysis/${analysisId}/deployments/${deploymentId}`);
+  }
+  /** Run a deployment now. */
+  runAutoMLDeployment(workspaceId: string, analysisId: string, deploymentId: string) {
+    return this.request("POST", `/automl/workspaces/${workspaceId}/analysis/${analysisId}/deployments/${deploymentId}/execute`);
+  }
+  /** What-if analysis. config: { features: { column: value, ... } }. */
+  autoMLWhatIf(workspaceId: string, analysisId: string, modelId: string, config: Config) {
+    return this.request("POST", `/automl/workspaces/${workspaceId}/analysis/${analysisId}/models/${modelId}/whatif`, { config });
   }
 }
