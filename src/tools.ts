@@ -142,6 +142,9 @@ const TABLE_DATATYPES = [
   "GEO",
 ] as const;
 
+// The add-column endpoint additionally accepts DURATION (not valid in create-table designs).
+const COLUMN_DATATYPES = [...TABLE_DATATYPES, "DURATION"] as const;
+
 const cellValue = z.union([z.string(), z.number(), z.boolean()]);
 
 export interface RegisterToolsOptions {
@@ -394,6 +397,9 @@ export function registerTools(
           const st = (await client.getExportJobStatus(workspace_id, String(jobId))) as AnyRec;
           const code = String(st?.data?.jobCode ?? "");
           if (code === JOB_CODE.COMPLETED) break;
+          if (code === JOB_CODE.ERROR) {
+            throw new Error(`Export job ${jobId} FAILED server-side (jobCode 1003). Details: ${JSON.stringify(st?.data ?? {})}`);
+          }
           if (code === JOB_CODE.INVALID) throw new Error(`Export job ${jobId} is invalid (jobCode 1005).`);
           if (Date.now() + interval >= deadline) {
             return {
@@ -446,7 +452,7 @@ export function registerTools(
     "zoho_get_export_job",
     {
       description:
-        "Check an asynchronous export job's status (jobCode 1001/1002 = running, 1004 = done, 1005 = invalid). Set download=true to also fetch the data once the job is complete — returns parsed rows for json exports or raw text for csv.",
+        "Check an asynchronous export job's status (jobCode 1001/1002 = running, 1003 = FAILED server-side, 1004 = done, 1005 = invalid). Set download=true to also fetch the data once the job is complete — returns parsed rows for json exports or raw text for csv.",
       inputSchema: {
         workspace_id: z.string().describe("Workspace id."),
         job_id: z.string().describe("Export job id from zoho_create_export_job / zoho_query_data."),
@@ -459,7 +465,14 @@ export function registerTools(
       run(async () => {
         const st = (await client.getExportJobStatus(workspace_id, job_id)) as AnyRec;
         const code = String(st?.data?.jobCode ?? "");
-        const status = { job_id, job_code: code, done: code === JOB_CODE.COMPLETED, detail: st?.data ?? st };
+        const status = {
+          job_id,
+          job_code: code,
+          done: code === JOB_CODE.COMPLETED,
+          failed: code === JOB_CODE.ERROR,
+          ...(code === JOB_CODE.ERROR ? { note: "Job failed server-side (jobCode 1003) — stop polling; see detail for the error." } : {}),
+          detail: st?.data ?? st,
+        };
         if (!download || code !== JOB_CODE.COMPLETED) return status;
         const raw = await client.downloadExportData(workspace_id, job_id);
         const { rows, raw: rawJson } = parseExportRows(raw);
@@ -477,7 +490,7 @@ export function registerTools(
     "zoho_get_import_job",
     {
       description:
-        "Check an asynchronous import job's status and summary (jobCode 1004 = done; jobInfo.importSummary has totalRowCount / successRowCount / warnings). Use after zoho_import_data when you didn't wait inline.",
+        "Check an asynchronous import job's status and summary (jobCode 1001/1002 = running, 1003 = FAILED server-side, 1004 = done, 1005 = invalid; jobInfo.importSummary has totalRowCount / successRowCount / warnings). Use after zoho_import_data when you didn't wait inline.",
       inputSchema: {
         workspace_id: z.string().describe("Workspace id."),
         job_id: z.string().describe("Import job id from zoho_import_data."),
@@ -535,6 +548,9 @@ export function registerTools(
     async ({ workspace_id, view_id, columns, criteria, update_all_rows, add_if_not_exist, date_format, dry_run }) => {
       if (!criteria && !update_all_rows) {
         return fail("Provide `criteria` to target rows, or pass update_all_rows=true to update every row.");
+      }
+      if (criteria && update_all_rows) {
+        return fail("Pass either `criteria` OR update_all_rows=true — not both (ambiguous: all-rows would override the filter).");
       }
       if (dry_run) {
         return ok({
@@ -658,6 +674,9 @@ export function registerTools(
           if (code === JOB_CODE.COMPLETED) {
             return { job_id: jobId, done: true, summary: st?.data?.jobInfo?.importSummary ?? st?.data };
           }
+          if (code === JOB_CODE.ERROR) {
+            throw new Error(`Import job ${jobId} FAILED server-side (jobCode 1003). Details: ${JSON.stringify(st?.data ?? {})}`);
+          }
           if (code === JOB_CODE.INVALID) throw new Error(`Import job ${jobId} is invalid (jobCode 1005).`);
           if (Date.now() + interval >= deadline) {
             return { job_id: jobId, done: false, job_code: code, note: "Import still running. Poll zoho_get_import_job." };
@@ -731,13 +750,13 @@ export function registerTools(
     "zoho_delete_view",
     {
       description:
-        "Permanently DELETE a view/table by id from a workspace. Irreversible — removes the view and its data. Use dry_run to confirm the target first.",
+        "Delete a view/table by id — moves it to the workspace TRASH (recoverable with zoho_restore_view; permanently erase it with zoho_delete_trash_view). Dependent views may be affected. Use dry_run to confirm the target first.",
       inputSchema: {
         workspace_id: z.string().describe("Workspace id."),
         view_id: z.string().describe("View/table id to delete."),
         dry_run: z.boolean().optional().describe("Confirm the target without deleting anything."),
       },
-      annotations: { title: "Delete view", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+      annotations: { title: "Delete view (move to trash)", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
     async ({ workspace_id, view_id, dry_run }) => {
       if (dry_run) return ok({ dry_run: true, action: "delete_view", workspace_id, view_id, note: "Nothing was deleted." });
@@ -941,7 +960,7 @@ export function registerTools(
         workspace_id: ID("Workspace id."),
         view_id: ID("Table id."),
         column_name: z.string().describe("New column name."),
-        data_type: z.enum(TABLE_DATATYPES).describe("Column data type."),
+        data_type: z.enum(COLUMN_DATATYPES).describe("Column data type."),
         is_pii: z.boolean().optional().describe("Mark as a PII column."),
         geo_role: z.number().int().min(0).max(8).optional().describe("Geo role (required when data_type=GEO)."),
       },
@@ -1356,12 +1375,27 @@ export function registerTools(
   server.registerTool(
     "zoho_get_workspace_secret_key",
     {
-      description: "Get a workspace's secret key (used to authorize cross-org copies). Pass regenerate=true to rotate it.",
-      inputSchema: { workspace_id: ID("Workspace id."), regenerate: z.boolean().optional() },
-      annotations: { title: "Get workspace secret key", readOnlyHint: true, idempotentHint: false, openWorldHint: true },
+      description:
+        "Get a workspace's CURRENT secret key (used to authorize cross-org copies). Read-only — to rotate the key use zoho_regenerate_workspace_secret_key.",
+      inputSchema: { workspace_id: ID("Workspace id.") },
+      annotations: { title: "Get workspace secret key", ...READ_ONLY },
     },
-    async ({ workspace_id, regenerate }) =>
-      run(() => client.getWorkspaceSecretKey(workspace_id, regenerate ? { regenerateKey: true } : undefined)),
+    async ({ workspace_id }) => run(() => client.getWorkspaceSecretKey(workspace_id)),
+  );
+
+  writeTool(
+    "zoho_regenerate_workspace_secret_key",
+    {
+      description:
+        "ROTATE a workspace's secret key — generates a new key and INVALIDATES the old one (anything still using the old key for cross-org copies breaks). Returns the new key.",
+      inputSchema: { workspace_id: ID("Workspace id."), dry_run: z.boolean().optional() },
+      annotations: { title: "Regenerate workspace secret key", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ workspace_id, dry_run }) => {
+      if (dry_run) return ok({ dry_run: true, action: "regenerate_workspace_secret_key", workspace_id, note: "Would rotate the key, invalidating the old one. Nothing was changed." });
+      audit("regenerate_workspace_secret_key", { workspace_id });
+      return run(() => client.getWorkspaceSecretKey(workspace_id, { regenerateKey: true }));
+    },
   );
 
   writeTool(

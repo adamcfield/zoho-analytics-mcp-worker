@@ -19,14 +19,18 @@ or contact the maintainer directly.
 - **Safe by default.** Write/state-changing calls (add/update/delete row, import, create, delete
   view) are never auto-retried; only idempotent GETs retry, with `Retry-After`-aware backoff. Batch
   reads (`zoho_describe_workspace`) use bounded concurrency so they don't trip the per-minute
-  frequency limiter. Mutating tools accept `dry_run`, and "update/delete all rows" requires an
-  explicit `update_all_rows`/`delete_all_rows` flag rather than an empty criteria.
-- **No secrets in the repo**; non-PII audit logging of state-changing calls (method + path only);
-  optional `MCP_READONLY=true` mode that registers read tools only.
+  frequency limiter. The highest-risk destructive tools (row updates/deletes, imports, view /
+  column / folder / workspace deletes, share & user removals, key rotation) accept `dry_run`, and
+  "update/delete all rows" requires an explicit `update_all_rows`/`delete_all_rows` flag rather
+  than an empty criteria (passing both a criteria and the all-rows flag is rejected as ambiguous).
+- **No secrets in the repo**; non-PII audit logging of state-changing calls (method + path at the
+  HTTP layer, plus action-level lines with resource names/counts — never row data or email
+  addresses); optional `MCP_READONLY=true` mode that registers read tools only.
 
 ## Dependencies
 
 The runtime stack is `agents@^0.14.5` + `@modelcontextprotocol/sdk@^1.29.0` + `zod@^4`, which
 clears the earlier MCP SDK advisories (ReDoS, cross-client instance reuse, DNS-rebinding default).
 `npm audit` reports **0 vulnerabilities**, verified in CI on every push/PR. `ai`/`react` are
-required peers of `agents` but are not imported into the Worker bundle (`ai` is aliased to a stub).
+required peers of `agents` but nothing on the `agents/mcp` server path imports them, so they are
+not part of the Worker bundle.

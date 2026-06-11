@@ -17,7 +17,7 @@
  *   MCP_AUTH_TOKEN       shared secret clients send as `Authorization: Bearer <...>`
  * Vars (wrangler.jsonc [vars] or secrets):
  *   ZOHO_ORG_ID          ZANALYTICS-ORGID (get it from zoho_get_orgs)
- *   ZOHO_DC              data center: com | eu | in | au | jp | sa | ca | uk (default com)
+ *   ZOHO_DC              data center: com | eu | in | au | jp | sa | ca | uk | cn (default com)
  * Optional:
  *   ZOHO_ACCESS_TOKEN    static access token (expires hourly; testing only — skips refresh)
  *   ZOHO_ANALYTICS_BASE_URL, ZOHO_ACCOUNTS_BASE_URL   explicit endpoint overrides
@@ -67,7 +67,7 @@ export function clientFromEnv(env: Env): ZohoAnalyticsClient {
 }
 
 export class ZohoAnalyticsMCP extends McpAgent<Env> {
-  server = new McpServer({ name: "zoho-analytics", version: "1.1.0" });
+  server = new McpServer({ name: "zoho-analytics", version: "1.1.1" });
 
   async init(): Promise<void> {
     registerTools(this.server, clientFromEnv(this.env), {

@@ -8,6 +8,5 @@
     "bindings": [{ "name": "MCP_OBJECT", "class_name": "ZohoAnalyticsMCP" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ZohoAnalyticsMCP"] }],
-  "alias": { "ai": "./src/ai-stub.ts" },
   "observability": { "enabled": true }
 }

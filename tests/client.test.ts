@@ -18,9 +18,11 @@ const mkRefresh = () =>
   });
 
 type Resp = { status: number; body: string; headers?: Record<string, string> };
+/** fetch-shaped mock arg tuple so .mock.calls is typed (url, init). */
+type FetchArgs = [input: string | URL, init?: RequestInit];
 function mockSequence(responses: Resp[]) {
   let i = 0;
-  return vi.fn(async () => {
+  return vi.fn(async (..._args: FetchArgs) => {
     const r = responses[Math.min(i, responses.length - 1)];
     i++;
     return new Response(r.body, { status: r.status, headers: r.headers });
@@ -87,14 +89,14 @@ describe("request (JSON envelope)", () => {
 
 describe("CONFIG + headers", () => {
   it("URL-encodes CONFIG as a JSON query param and sends the auth + org headers", async () => {
-    const f = vi.fn(async () => new Response(JSON.stringify({ status: "success", data: { views: [] } }), { status: 200 }));
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(JSON.stringify({ status: "success", data: { views: [] } }), { status: 200 }));
     vi.stubGlobal("fetch", f);
     await mkStatic().getViews("WS", { keyword: "sales" });
-    const [url, init] = f.mock.calls[0] as [string, RequestInit];
-    expect(url).toContain("/restapi/v2/workspaces/WS/views");
-    expect(url).toContain("CONFIG=");
-    expect(decodeURIComponent(url)).toContain('{"keyword":"sales"}');
-    const headers = init.headers as Record<string, string>;
+    const [url, init] = f.mock.calls[0];
+    expect(String(url)).toContain("/restapi/v2/workspaces/WS/views");
+    expect(String(url)).toContain("CONFIG=");
+    expect(decodeURIComponent(String(url))).toContain('{"keyword":"sales"}');
+    const headers = init?.headers as Record<string, string>;
     expect(headers.Authorization).toBe("Zoho-oauthtoken tok");
     expect(headers["ZANALYTICS-ORGID"]).toBe("o");
   });
@@ -102,13 +104,13 @@ describe("CONFIG + headers", () => {
 
 describe("write transport (CONFIG placement)", () => {
   it("sends CONFIG in the form body (not the query) for writes", async () => {
-    const f = vi.fn(async () => new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 }));
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 }));
     vi.stubGlobal("fetch", f);
     await mkStatic().addRow("WS", "V", { columns: { a: 1 } });
-    const [url, init] = f.mock.calls[0] as [string, RequestInit];
-    expect(url).not.toContain("CONFIG=");
-    expect((init.headers as Record<string, string>)["Content-Type"]).toBe("application/x-www-form-urlencoded");
-    expect(decodeURIComponent(String(init.body))).toContain('"columns":{"a":1}');
+    const [url, init] = f.mock.calls[0];
+    expect(String(url)).not.toContain("CONFIG=");
+    expect((init?.headers as Record<string, string>)["Content-Type"]).toBe("application/x-www-form-urlencoded");
+    expect(decodeURIComponent(String(init?.body))).toContain('"columns":{"a":1}');
   });
 
   it("treats an empty 204 response as success", async () => {
@@ -116,20 +118,31 @@ describe("write transport (CONFIG placement)", () => {
     expect(await mkStatic().deleteView("WS", "V")).toEqual({ status: "success" });
   });
 
+  it("sends CONFIG in the form body for DELETE (destructive data ops)", async () => {
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", f);
+    await mkStatic().deleteRows("WS", "V", { criteria: '"T"."C"=\'x\'' });
+    const [url, init] = f.mock.calls[0];
+    expect(init?.method).toBe("DELETE");
+    expect(String(url)).not.toContain("CONFIG=");
+    expect((init?.headers as Record<string, string>)["Content-Type"]).toBe("application/x-www-form-urlencoded");
+    expect(decodeURIComponent(String(init?.body))).toContain('"criteria"');
+  });
+
   it("adds the ZANALYTICS-DEST-ORGID header for cross-org copies", async () => {
-    const f = vi.fn(async () => new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 }));
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 }));
     vi.stubGlobal("fetch", f);
     await mkStatic().copyViews("WS", { viewIds: ["v"], destWorkspaceId: "W2" }, "ORG2");
-    expect((f.mock.calls[0][1] as RequestInit).headers).toMatchObject({ "ZANALYTICS-DEST-ORGID": "ORG2" });
+    expect(f.mock.calls[0][1]?.headers).toMatchObject({ "ZANALYTICS-DEST-ORGID": "ORG2" });
   });
 
   it("keeps CONFIG in the query string and sends FormData for multipart import", async () => {
-    const f = vi.fn(async () => new Response(JSON.stringify({ status: "success", data: { jobId: "1" } }), { status: 200 }));
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(JSON.stringify({ status: "success", data: { jobId: "1" } }), { status: 200 }));
     vi.stubGlobal("fetch", f);
     await mkStatic().createImportJob("WS", "V", { content: "a,b\n1,2", name: "import.csv" }, { importType: "append", fileType: "csv" });
-    const [url, init] = f.mock.calls[0] as [string, RequestInit];
-    expect(url).toContain("CONFIG=");
-    expect(init.body instanceof FormData).toBe(true);
+    const [url, init] = f.mock.calls[0];
+    expect(String(url)).toContain("CONFIG=");
+    expect(init?.body instanceof FormData).toBe(true);
   });
 });
 
@@ -146,12 +159,21 @@ describe("requestRaw (export / download)", () => {
     );
     await expect(mkStatic().exportData("w", "v", { responseFormat: "json" })).rejects.toMatchObject({ errorCode: 8120 });
   });
+
+  it("throws with the HTTP status when an export fails with a non-envelope error body", async () => {
+    vi.stubGlobal("fetch", mockSequence([{ status: 400, body: "bad request" }]));
+    await expect(mkStatic().exportData("w", "v", { responseFormat: "csv" })).rejects.toMatchObject({
+      name: "ZohoAnalyticsError",
+      status: 400,
+      body: "bad request",
+    });
+  });
 });
 
 describe("OAuth token refresh", () => {
   it("mints an access token via the accounts endpoint, then caches it", async () => {
     let tokenCalls = 0;
-    const f = vi.fn(async (url: string | URL) => {
+    const f = vi.fn(async (...[url]: FetchArgs) => {
       const u = String(url);
       if (u.includes("/oauth/v2/token")) {
         tokenCalls++;
@@ -167,13 +189,13 @@ describe("OAuth token refresh", () => {
     const tokenCall = f.mock.calls.find((call) => String(call[0]).includes("/oauth/v2/token"))!;
     expect(String(tokenCall[0])).toContain("grant_type=refresh_token");
     const apiCall = f.mock.calls.find((call) => String(call[0]).includes("/restapi/v2/orgs"))!;
-    expect((apiCall[1] as RequestInit).headers).toMatchObject({ Authorization: "Zoho-oauthtoken AT1" });
+    expect(apiCall[1]?.headers).toMatchObject({ Authorization: "Zoho-oauthtoken AT1" });
   });
 
-  it("refreshes once and retries when the API returns 401", async () => {
+  it("refreshes once and retries with the NEW token when the API returns 401", async () => {
     let tokenCalls = 0;
     let apiCalls = 0;
-    const f = vi.fn(async (url: string | URL) => {
+    const f = vi.fn(async (...[url]: FetchArgs) => {
       const u = String(url);
       if (u.includes("/oauth/v2/token")) {
         tokenCalls++;
@@ -187,6 +209,25 @@ describe("OAuth token refresh", () => {
     await mkRefresh().getOrgs();
     expect(tokenCalls).toBe(2); // initial mint + one refresh after 401
     expect(apiCalls).toBe(2); // 401, then retried success
+    // The retried request must carry the freshly minted token, not replay the stale one.
+    const orgCalls = f.mock.calls.filter((c) => String(c[0]).includes("/restapi/v2/orgs"));
+    expect(orgCalls[1][1]?.headers).toMatchObject({ Authorization: "Zoho-oauthtoken AT2" });
+  });
+
+  it("deduplicates concurrent refreshes (single-flight): one token mint for a parallel batch", async () => {
+    let tokenCalls = 0;
+    const f = vi.fn(async (url: string | URL) => {
+      if (String(url).includes("/oauth/v2/token")) {
+        tokenCalls++;
+        await new Promise((r) => setTimeout(r, 5)); // let the other callers pile up
+        return new Response(JSON.stringify({ access_token: "AT", expires_in: 3600 }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", f);
+    const c = mkRefresh();
+    await Promise.all([c.getOrgs(), c.getOrgs(), c.getOrgs()]);
+    expect(tokenCalls).toBe(1);
   });
 
   it("surfaces an OAuth failure (error field with HTTP 200)", async () => {
@@ -195,7 +236,7 @@ describe("OAuth token refresh", () => {
   });
 
   it("never calls the token endpoint when a static token is supplied", async () => {
-    const f = vi.fn(async () => new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 }));
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 }));
     vi.stubGlobal("fetch", f);
     await mkStatic().getOrgs();
     expect(f.mock.calls.some((call) => String(call[0]).includes("/oauth/v2/token"))).toBe(false);

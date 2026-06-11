@@ -29,6 +29,9 @@ describe("parseExportRows", () => {
   it("handles the { data: [...] } keyValue form", () => {
     expect(parseExportRows(JSON.stringify({ data: [{ Region: "East" }] })).rows).toEqual([{ Region: "East" }]);
   });
+  it("handles the { data: { rows: [...] } } form", () => {
+    expect(parseExportRows(JSON.stringify({ data: { rows: [{ Region: "West" }] } })).rows).toEqual([{ Region: "West" }]);
+  });
   it("rebuilds rows from column_order + rows arrays", () => {
     const body = JSON.stringify({ response: { result: { column_order: ["Region", "Sales"], rows: [["East", 100], ["West", 50]] } } });
     expect(parseExportRows(body).rows).toEqual([

@@ -16,6 +16,5 @@
   "kv_namespaces": [
     { "binding": "OAUTH_KV", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
   ],
-  "alias": { "ai": "./src/ai-stub.ts" },
   "observability": { "enabled": true }
 }

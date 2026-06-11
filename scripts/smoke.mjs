@@ -7,9 +7,9 @@
  *   MCP_TOKEN=<bearer> \
  *   node scripts/smoke.mjs
  *
- * Checks: initialize handshake, tools/list (>= 90 tools incl. the headline
- * helpers), and zoho_whoami (which validates the Zoho OAuth credentials
- * end-to-end). With MCP_READONLY=true expect only the ~36 read tools.
+ * Checks: initialize handshake, tools/list (>= 90 tools on a full deploy;
+ * read-only deploys are auto-detected and write-tool checks skipped), and
+ * zoho_whoami (which validates the Zoho OAuth credentials end-to-end).
  * Exits non-zero if any check fails.
  */
 const URL = process.env.MCP_URL;
@@ -49,7 +49,8 @@ const check = (name, cond, extra = "") => {
   if (!cond) failures++;
 };
 
-const KEY_TOOLS = [
+// Read tools must be present on EVERY deployment (incl. MCP_READONLY=true).
+const READ_TOOLS = [
   "zoho_whoami",
   "zoho_get_orgs",
   "zoho_list_workspaces",
@@ -60,6 +61,11 @@ const KEY_TOOLS = [
   "zoho_query_data",
   "zoho_create_export_job",
   "zoho_get_export_job",
+  "zoho_list_users",
+  "zoho_get_view_url",
+];
+// Write tools are absent on MCP_READONLY deployments (auto-detected below).
+const WRITE_TOOLS = [
   "zoho_add_row",
   "zoho_update_rows",
   "zoho_delete_rows",
@@ -69,8 +75,6 @@ const KEY_TOOLS = [
   "zoho_create_report",
   "zoho_add_column",
   "zoho_share_views",
-  "zoho_list_users",
-  "zoho_get_view_url",
   "zoho_create_variable",
 ];
 
@@ -83,9 +87,13 @@ await rpc({ jsonrpc: "2.0", method: "notifications/initialized" });
 
 const list = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" });
 const tools = list.body?.result?.tools ?? [];
-// Full deploy registers ~101 tools; MCP_READONLY trims to ~36 reads.
-check("tools/list", tools.length >= 30, `(${tools.length} tools)`);
-for (const t of KEY_TOOLS) check(`tool present: ${t}`, tools.some((x) => x.name === t));
+// Detect a read-only (MCP_READONLY=true) deployment by the absence of write tools.
+const readonly = !WRITE_TOOLS.some((t) => tools.some((x) => x.name === t));
+if (readonly) console.log("note: read-only deployment detected — skipping write-tool checks");
+// Full deploy registers ~102 tools; MCP_READONLY trims to ~36 reads.
+check("tools/list", tools.length >= (readonly ? 30 : 90), `(${tools.length} tools)`);
+for (const t of READ_TOOLS) check(`tool present: ${t}`, tools.some((x) => x.name === t));
+if (!readonly) for (const t of WRITE_TOOLS) check(`tool present: ${t}`, tools.some((x) => x.name === t));
 
 const who = await rpc({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "zoho_whoami", arguments: {} } });
 let whoOk = false;

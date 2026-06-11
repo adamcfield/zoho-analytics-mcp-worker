@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.1.1 — Hardening pass (adversarial review)
+
+A multi-agent review against Zoho's docs/OpenAPI specs surfaced 18 confirmed issues; all fixed.
+
+### Fixed
+- **Bulk job failures detected.** `JOB_CODE` now models `1003` (ERROR OCCURRED): the polling loops
+  in `zoho_query_data` / `zoho_import_data` stop and raise with the server's error details instead
+  of reporting a failed job as "still running" until timeout; `zoho_get_export_job` returns a
+  `failed` flag. (Previously a failed job burned the full poll window, then advised more polling.)
+- **`MCP_READONLY` no longer leaks a write path.** Secret-key rotation moved out of the read tool:
+  `zoho_get_workspace_secret_key` is now strictly read-only and a new gated
+  `zoho_regenerate_workspace_secret_key` (destructive, `dry_run`) does the rotation.
+- **OAuth refresh hardened.** Concurrent callers now share a single in-flight refresh
+  (single-flight) instead of stampeding the token endpoint on a cold isolate, and a throttled
+  (HTTP 429) refresh is retried instead of failing immediately.
+- **`zoho_update_rows`** rejects `criteria` + `update_all_rows` together (previously forwarded
+  both, risking an all-rows update when Zoho gives the flag precedence).
+- **CN data center** added (`analyticsapi.zoho.com.cn` / `accounts.zoho.com.cn`).
+- **`zoho_add_column`** accepts `DURATION` (its description promised it; the enum rejected it).
+- **`zoho_delete_view`** description corrected: it moves the view to trash (restorable), not a
+  permanent delete.
+- **Smoke test** auto-detects read-only deployments and skips write-tool checks (previously could
+  never pass against `MCP_READONLY=true`).
+- **Docs corrected:** secret-key tool placement, audit-trail description (action-level lines log
+  resource names/counts, not just method+path), `dry_run` scope (destructive tools, not all
+  writes), `ai`/`react` peer-dependency status.
+
+### Removed
+- The inert `ai`-stub alias (`src/ai-stub.ts`): the bundle is byte-identical without it, its
+  rationale was wrong for `agents@0.14` (no lazy `import("ai")`), and `ai` is installed anyway as
+  a required peer.
+
+### Changed
+- Test files are now typechecked (`tsconfig.json` includes `tests/`); fetch mocks properly typed.
+- **40 tests** (new: single-flight refresh, 401-retry asserts the fresh token, DELETE-with-CONFIG
+  form body, raw-export HTTP error, `{data:{rows}}` parse variant).
+
 ## 1.1.0 — Full API coverage
 
 ### Added

@@ -31,6 +31,7 @@ export const DC_DOMAINS: Record<string, { api: string; accounts: string }> = {
   sa: { api: "analyticsapi.zoho.sa", accounts: "accounts.zoho.sa" },
   ca: { api: "analyticsapi.zohocloud.ca", accounts: "accounts.zohocloud.ca" },
   uk: { api: "analyticsapi.zoho.uk", accounts: "accounts.zoho.uk" },
+  cn: { api: "analyticsapi.zoho.com.cn", accounts: "accounts.zoho.com.cn" },
 };
 
 /** Zoho Analytics view-type codes -> human-readable. */
@@ -46,10 +47,11 @@ export const VIEW_TYPE_NAMES: Record<string, string> = {
 
 /** Bulk job status codes (jobCode) returned while polling import/export jobs. */
 export const JOB_CODE = {
-  IN_PROGRESS_A: "1001",
-  IN_PROGRESS_B: "1002",
-  COMPLETED: "1004",
-  INVALID: "1005",
+  IN_PROGRESS_A: "1001", // JOB NOT INITIATED
+  IN_PROGRESS_B: "1002", // JOB IN PROGRESS
+  ERROR: "1003", //         ERROR OCCURRED — stop polling, inspect the error message
+  COMPLETED: "1004", //     JOB COMPLETED
+  INVALID: "1005", //       JOB NOT FOUND
 } as const;
 
 export class ZohoAnalyticsError extends Error {
@@ -114,7 +116,7 @@ export interface ZohoAnalyticsClientOptions {
   accessToken?: string;
   /** ZANALYTICS-ORGID sent on workspace/view/data calls. */
   orgId?: string;
-  /** Data-center key: com | eu | in | au | jp | sa | ca | uk. Default "com". */
+  /** Data-center key: com | eu | in | au | jp | sa | ca | uk | cn. Default "com". */
   dc?: string;
   /** Override the API root, e.g. "https://analyticsapi.zoho.com". */
   analyticsBaseUrl?: string;
@@ -154,6 +156,8 @@ export class ZohoAnalyticsClient {
   // Cached access token + absolute expiry (epoch ms).
   private accessToken?: string;
   private accessTokenExpiry = 0;
+  // In-flight refresh shared by concurrent callers (single-flight).
+  private refreshPromise?: Promise<string>;
 
   constructor(opts: ZohoAnalyticsClientOptions) {
     const hasRefresh = !!(opts.refreshToken && opts.clientId && opts.clientSecret);
@@ -193,7 +197,13 @@ export class ZohoAnalyticsClient {
     if (this.accessToken && Date.now() < this.accessTokenExpiry - 60_000) {
       return this.accessToken;
     }
-    return this.refreshAccessToken();
+    // Single-flight: concurrent callers (e.g. a mapLimit batch on a cold isolate)
+    // share one refresh instead of stampeding the token endpoint — Zoho rate-limits
+    // access-token creation per refresh token (~10 per 10 minutes).
+    this.refreshPromise ??= this.refreshAccessToken().finally(() => {
+      this.refreshPromise = undefined;
+    });
+    return this.refreshPromise;
   }
 
   /** Exchange the refresh token for a fresh access token at the accounts endpoint. */
@@ -232,7 +242,7 @@ export class ZohoAnalyticsClient {
         // Zoho reports OAuth failures as { error: "invalid_code" } with HTTP 200.
         const errCode = typeof data.error === "string" ? data.error : `HTTP ${res.status}`;
         lastErr = `${errCode}${text && !data.error ? `: ${text}` : ""}`;
-        if (res.status < 500) break; // client error -> don't retry
+        if (res.status < 500 && res.status !== 429) break; // permanent client error -> don't retry (429 is transient)
       } catch (err) {
         clearTimeout(timer);
         lastErr = err instanceof Error ? err.message : String(err);
