@@ -58,6 +58,17 @@ async function run(fn: () => Promise<unknown>): Promise<ToolResult> {
   try {
     return ok(await fn());
   } catch (err) {
+    // Surface failures in `wrangler tail` / Workers Logs too — without this, a
+    // failed tool call leaves zero server-side trace for incident debugging.
+    try {
+      const line =
+        err instanceof ZohoAnalyticsError
+          ? `${err.method} ${err.path} -> ${err.status}${err.errorCode != null ? ` (errorCode ${err.errorCode})` : ""}`
+          : (err instanceof Error ? err.message : String(err)).slice(0, 200);
+      console.error(`[zoho-analytics-mcp error] ${line}`);
+    } catch {
+      /* logging must never break a tool call */
+    }
     if (err instanceof ZohoAnalyticsError) {
       return fail(
         `Zoho Analytics API error ${err.status}` +
@@ -79,6 +90,17 @@ function audit(action: string, meta: Record<string, unknown>): void {
 }
 
 // ---- Helpers shared by the tools (exported for unit tests) ----
+
+/**
+ * Is this view a table-like view whose columns can be fetched? Zoho's docs say
+ * viewType is a numeric code, but the live API returns NAME strings — accept
+ * both (the round-1 fix corrected only the display mapping; the live MCP pass
+ * caught this gate still code-only, which silently skipped ALL column fetches).
+ */
+export const isTabularViewType = (viewType: unknown): boolean => {
+  const s = String(viewType ?? "");
+  return ["0", "1", "6", "Table", "Tabular View", "Query Table"].includes(s);
+};
 
 // Zoho's docs describe viewType as a numeric code, but live responses can carry
 // name strings ("Table", "AnalysisView", "Dashboard") — accept both.
@@ -432,7 +454,8 @@ export function registerTools(
       run(async () => {
         // Schema maps are expensive (1 + N API calls) and change rarely — serve
         // from the short-TTL cache when available to save API units.
-        const cacheKey = `zoho-cache:describe:${workspace_id}:${include_columns !== false}:${max_views ?? 50}`;
+        // v2: busts entries cached before the isTabularViewType fix (those have no columns).
+        const cacheKey = `zoho-cache:describe:v2:${workspace_id}:${include_columns !== false}:${max_views ?? 50}`;
         if (opts.cache) {
           try {
             const hit = await opts.cache.get(cacheKey);
@@ -447,8 +470,7 @@ export function registerTools(
         const wantCols = include_columns !== false;
         const described = await mapLimit(views, concurrency ?? 4, async (v) => {
           const base = compactView(v);
-          const isTabular = ["0", "1", "6"].includes(String(v.viewType)); // Table, Tabular View, Query Table
-          if (!wantCols || !isTabular || !v.viewId) return base;
+          if (!wantCols || !isTabularViewType(v.viewType) || !v.viewId) return base;
           try {
             const detail = (await client.getViewDetails(String(v.viewId), { withInvolvedMetaInfo: true })) as AnyRec;
             return { ...base, columns: extractColumns(detail) };

@@ -34,7 +34,7 @@ import OAuthProvider from "@cloudflare/workers-oauth-provider";
 import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ZohoAnalyticsClient, kvTokenStore, DC_DOMAINS } from "./zohoanalytics.js";
+import { ZohoAnalyticsClient, kvTokenStore, DC_DOMAINS, constantTimeEqual } from "./zohoanalytics.js";
 import { registerTools, registerResourcesAndPrompts } from "./tools.js";
 
 // Reuses the bearer worker's global Cloudflare.Env (MCP_OBJECT, ZOHO_*, etc.)
@@ -61,7 +61,7 @@ type AuthRequest = Awaited<ReturnType<OAuthHelpers["parseAuthRequest"]>>;
 
 /** The MCP agent — identical tool surface to the bearer worker. */
 export class ZohoAnalyticsMCP extends McpAgent<Env, unknown, Props> {
-  server = new McpServer({ name: "zoho-analytics", version: "1.6.1" });
+  server = new McpServer({ name: "zoho-analytics", version: "1.6.2" });
 
   async init(): Promise<void> {
     // Multi-user grants carry the user's own refresh token in (encrypted) props;
@@ -121,14 +121,6 @@ export class ZohoAnalyticsMCP extends McpAgent<Env, unknown, Props> {
     });
     registerResourcesAndPrompts(this.server, client);
   }
-}
-
-/** Length-safe constant-time string comparison. */
-function safeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let mismatch = 0;
-  for (let i = 0; i < a.length; i++) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return mismatch === 0;
 }
 
 /** UTF-8-safe base64 round-trip (btoa alone throws on code points > 0xFF, e.g. a unicode OAuth `state`). */
@@ -378,7 +370,7 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
     }
 
     // Fail closed: no passphrase configured -> reject everything.
-    if (!env.APP_PASSPHRASE || !safeEqual(passphrase, env.APP_PASSPHRASE)) {
+    if (!env.APP_PASSPHRASE || !constantTimeEqual(passphrase, env.APP_PASSPHRASE)) {
       await recordFailedAttempt(env, ip);
       return consentPage(reqInfo, await clientName(env, reqInfo.clientId), "Incorrect passphrase. Try again.");
     }

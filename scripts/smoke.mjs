@@ -89,8 +89,10 @@ const list = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" });
 const tools = list.body?.result?.tools ?? [];
 const has = (t) => tools.some((x) => x.name === t);
 // Independent flags: MCP_CORE trims to ~26 curated tools; MCP_READONLY drops all
-// write tools. Both can be set together (~18 reads). Detect each on its own.
-const core = tools.length < 60; // full=~144, readonly=~51, core=~26, readonly+core=~18
+// write tools. Both can be set together (~18 reads). Detect each STRUCTURALLY —
+// a count threshold misclassified readonly (51 tools) as core. zoho_get_view_url
+// is a read tool registered in full and readonly deploys but absent from CORE_TOOLS.
+const core = !has("zoho_get_view_url");
 const readonly = !WRITE_TOOLS.some(has);
 if (core) console.log("note: MCP_CORE deployment detected (~26 curated tools)");
 if (readonly) console.log("note: read-only deployment detected — skipping write-tool checks");

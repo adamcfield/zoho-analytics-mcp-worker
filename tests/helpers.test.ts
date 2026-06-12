@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { readableViewType, compactView, parseExportRows, extractColumns, capRows } from "../src/tools.js";
+import { readableViewType, isTabularViewType, compactView, parseExportRows, extractColumns, capRows } from "../src/tools.js";
 
 describe("readableViewType", () => {
   it("maps known view-type codes and passes through unknown", () => {
@@ -13,6 +13,25 @@ describe("readableViewType", () => {
     expect(readableViewType("AnalysisView")).toBe("AnalysisView");
     expect(readableViewType("Query Table")).toBe("Query Table");
     expect(readableViewType("Dashboard")).toBe("Dashboard");
+  });
+});
+
+describe("isTabularViewType", () => {
+  it("matches table-like views by BOTH numeric code and live name string", () => {
+    // Codes (per Zoho's docs)…
+    expect(isTabularViewType(0)).toBe(true);
+    expect(isTabularViewType("1")).toBe(true);
+    expect(isTabularViewType("6")).toBe(true);
+    // …and names (what the live API actually returns — the gate that silently
+    // skipped all column fetches when it was code-only).
+    expect(isTabularViewType("Table")).toBe(true);
+    expect(isTabularViewType("Tabular View")).toBe(true);
+    expect(isTabularViewType("Query Table")).toBe(true);
+    // Non-tabular views must not trigger column fetches.
+    expect(isTabularViewType("AnalysisView")).toBe(false);
+    expect(isTabularViewType("Dashboard")).toBe(false);
+    expect(isTabularViewType(7)).toBe(false);
+    expect(isTabularViewType(undefined)).toBe(false);
   });
 });
 

@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.6.2 — Final production sweep (4 code findings + 1 live-caught functional bug)
+
+The whole-system production sweep (client, tools, workers, architecture, tests, week-one ops)
+confirmed only 4 issues — and live native-MCP validation caught one real functional bug no
+static pass could see:
+
+### Fixed
+- **`describe_workspace` columns actually fetch now.** The column-fetch gate checked Zoho's
+  documented numeric view-type codes, but the live API returns name strings ("Table") — so the
+  schema map's headline feature silently never fired. Extracted as `isTabularViewType` (accepts
+  both forms), unit-tested, and the cache key bumped to v2 so stale column-less entries expire.
+- **Smoke gate mode detection is structural** (presence of `zoho_get_view_url`, a read tool
+  absent from CORE) — the count threshold misclassified MCP_READONLY (51 tools) as MCP_CORE,
+  silently weakening the post-deploy verification floor from 40 to 12.
+- **Failed tool calls now log server-side** (`[zoho-analytics-mcp error] METHOD /path -> status
+  (errorCode)`) — previously a failure left zero trace in `wrangler tail` for incident debugging.
+- `constantTimeEqual` is now genuinely shared by both workers' auth gates (was triplicated with
+  a comment claiming otherwise); CI syntax-checks `live-test.mjs` alongside `smoke.mjs`.
+
+### Live validation (native MCP client path)
+whoami ✓ · describe_workspace ✓ (and `cached: true` on repeat — KV cache live) ·
+`zoho://workspaces` resource read ✓ (previously-untested callback) · query job create/poll ✓.
+
+63 tests.
+
 ## 1.6.0 — Everyday-consumer release (all 12 improvement items)
 
 Built for the project's end goal: a tool surface a Sonnet-class assistant uses every day.

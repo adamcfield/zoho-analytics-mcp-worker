@@ -27,7 +27,7 @@
 
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ZohoAnalyticsClient, kvTokenStore, signDownloadToken, verifyDownloadToken } from "./zohoanalytics.js";
+import { ZohoAnalyticsClient, kvTokenStore, signDownloadToken, verifyDownloadToken, constantTimeEqual } from "./zohoanalytics.js";
 import { registerTools, registerResourcesAndPrompts, type RegisterToolsOptions } from "./tools.js";
 
 /** Workers Rate Limiting binding (open beta) — structural type. */
@@ -125,7 +125,7 @@ export function integrationsFromEnv(env: Env): Pick<RegisterToolsOptions, "track
 }
 
 export class ZohoAnalyticsMCP extends McpAgent<Env> {
-  server = new McpServer({ name: "zoho-analytics", version: "1.6.1" });
+  server = new McpServer({ name: "zoho-analytics", version: "1.6.2" });
 
   async init(): Promise<void> {
     const client = clientFromEnv(this.env);
@@ -140,16 +140,6 @@ export class ZohoAnalyticsMCP extends McpAgent<Env> {
   }
 }
 
-/** Length-safe constant-time string comparison. */
-function safeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let mismatch = 0;
-  for (let i = 0; i < a.length; i++) {
-    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return mismatch === 0;
-}
-
 function authorized(request: Request, env: Env): boolean {
   // Fail closed: if no secret is configured, reject everything.
   if (!env.MCP_AUTH_TOKEN) return false;
@@ -157,7 +147,7 @@ function authorized(request: Request, env: Env): boolean {
   // RFC 7235: the auth-scheme is case-insensitive.
   const match = /^Bearer\s+(.+)$/i.exec(header);
   if (!match) return false;
-  return safeEqual(match[1], env.MCP_AUTH_TOKEN);
+  return constantTimeEqual(match[1], env.MCP_AUTH_TOKEN);
 }
 
 export default {
