@@ -14,7 +14,7 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ZohoAnalyticsMCP"] }],
   "kv_namespaces": [
-    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+    { "binding": "OAUTH_KV", "id": "7fc518d9560848cc96c06ba5d8d1ef57" }
   ],
   "observability": { "enabled": true }
 }
