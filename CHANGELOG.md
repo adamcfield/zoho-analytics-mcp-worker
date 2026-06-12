@@ -25,6 +25,28 @@ whoami ✓ · describe_workspace ✓ (and `cached: true` on repeat — KV cache 
 
 63 tests.
 
+## 1.6.1 — Security & robustness fixes for the v1.6.0 additions (18 findings)
+
+Adversarial sweep of the v1.6.0 diff confirmed 18 issues; all fixed.
+
+### Security (multi-user OAuth mode, off by default)
+- **Confused-deputy closed:** multi-user consent now shows an MCP consent screen (displaying the
+  requesting client) BEFORE redirecting to Zoho — an attacker-registered MCP client can no longer
+  silently capture a victim's Zoho grant.
+- **Passphrase bypass closed:** the passphrase POST can no longer complete authorization when
+  `ZOHO_MULTI_USER=true` (the consent POST routes to Zoho login instead).
+- **Cross-user cache leak closed:** the describe-workspace schema cache is namespaced per grant in
+  multi-user mode (was shared — metadata disclosure across users / Zoho authz bypass).
+- `/download`: malformed %-encoding returns 400 (was an unhandled 500); responses carry
+  `cache-control: no-store` + `X-Content-Type-Options: nosniff`.
+
+### Robustness
+- Degraded (columns_error) schema maps are no longer cached; credential-less grants register an
+  explanatory `zoho_reauthorize_required` tool instead of 500-ing; `handleZohoCallback` returns 400
+  on an expired/tampered auth request; smoke.mjs detects MCP_CORE/MCP_READONLY independently;
+  live-test.mjs treats JSON-RPC errors as failures and guarantees table cleanup via try/finally.
+- Docs reconciled with multi-user mode (oauth.ts header, README limitations, telemetry caveat).
+
 ## 1.6.0 — Everyday-consumer release (all 12 improvement items)
 
 Built for the project's end goal: a tool surface a Sonnet-class assistant uses every day.

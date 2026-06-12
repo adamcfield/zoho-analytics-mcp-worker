@@ -438,8 +438,10 @@ src/
                     CONFIG-param + envelope handling, DC routing, retry/backoff, mapLimit (shared)
 tests/              vitest unit tests (client OAuth/retry/DC/CONFIG, helpers)
 vitest.config.ts    test config (resolves NodeNext .js specifiers to .ts)
-scripts/smoke.mjs   smoke test against a deployed worker (npm run smoke)
-.github/workflows/ci.yml      CI — typecheck + tests + smoke-script syntax check on push/PR
+scripts/smoke.mjs     smoke test against a deployed worker (npm run smoke); auto-detects CORE/READONLY modes
+scripts/live-test.mjs guarded LIVE write-path integration test (MCP_URL + MCP_TOKEN + LIVE_WRITE=1) —
+                      creates a disposable table, exercises rows/SQL/dry-runs, cleans up via trash + purge
+.github/workflows/ci.yml      CI — typecheck + tests + syntax checks for both scripts on push/PR
 .github/workflows/deploy.yml  gated manual deploy (typecheck + tests -> wrangler deploy -> live smoke); needs CLOUDFLARE_API_TOKEN secret
 wrangler.jsonc        bearer worker config (zoho-analytics-mcp)
 wrangler.oauth.jsonc  OAuth worker config (zoho-analytics-mcp-oauth) — adds OAUTH_KV
