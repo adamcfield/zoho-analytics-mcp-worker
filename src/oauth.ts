@@ -5,21 +5,29 @@
  * OAuth 2.1 provider (@cloudflare/workers-oauth-provider) so it can be added to
  * Claude.ai as a custom connector (Claude.ai web requires OAuth, not a bearer).
  *
- * Access is gated by a single shared passphrase (APP_PASSPHRASE) entered on the
- * consent screen — single-user by design. (This is the connector login; it is
- * separate from the Zoho OAuth credentials the server uses to call the API.)
+ * Two consent modes (both show the requesting client and require an explicit
+ * approval click before anything proceeds):
+ *   - SINGLE-USER (default): a shared passphrase (APP_PASSPHRASE); the server
+ *     calls Zoho with one worker-wide refresh token.
+ *   - MULTI-USER (ZOHO_MULTI_USER=true): the approval click hands off to a real
+ *     Zoho login (authorization-code flow); each user's own refresh token is
+ *     stored in the encrypted OAuth grant props and the server acts as them.
  *
  * Routes:
  *   GET  /                         health check (no auth)
- *   GET/POST /authorize            passphrase consent screen   (this file)
+ *   GET/POST /authorize            consent screen (passphrase or Zoho-login)
+ *   GET  /zoho/callback            multi-user: Zoho redirect back (this file)
  *   /token, /register, /.well-known/oauth-*   handled by OAuthProvider
  *   POST /mcp · GET /sse           MCP transports (OAuth-protected)
  *
  * Secrets (wrangler secret put ... -c wrangler.oauth.jsonc):
- *   ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN   Zoho OAuth app creds
- *   APP_PASSPHRASE     passphrase that authorizes the connector
- * Vars / optional: ZOHO_ORG_ID, ZOHO_DC, ZOHO_ACCESS_TOKEN,
- *   ZOHO_ANALYTICS_BASE_URL, ZOHO_ACCOUNTS_BASE_URL, ZOHO_MAX_RETRIES, MCP_READONLY
+ *   ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET   Zoho OAuth app creds (server-based app
+ *     with redirect <origin>/zoho/callback when multi-user)
+ *   ZOHO_REFRESH_TOKEN   single-user only
+ *   APP_PASSPHRASE       single-user only
+ * Vars / optional: ZOHO_MULTI_USER, ZOHO_ORG_ID, ZOHO_DC, ZOHO_ACCESS_TOKEN,
+ *   ZOHO_ANALYTICS_BASE_URL, ZOHO_ACCOUNTS_BASE_URL, ZOHO_MAX_RETRIES,
+ *   MCP_READONLY, MCP_CORE
  */
 
 import OAuthProvider from "@cloudflare/workers-oauth-provider";
@@ -53,18 +61,45 @@ type AuthRequest = Awaited<ReturnType<OAuthHelpers["parseAuthRequest"]>>;
 
 /** The MCP agent — identical tool surface to the bearer worker. */
 export class ZohoAnalyticsMCP extends McpAgent<Env, unknown, Props> {
-  server = new McpServer({ name: "zoho-analytics", version: "1.6.0" });
+  server = new McpServer({ name: "zoho-analytics", version: "1.6.1" });
 
   async init(): Promise<void> {
     // Multi-user grants carry the user's own refresh token in (encrypted) props;
     // single-user grants fall back to the worker-wide secret.
     const props = this.props as Props | undefined;
     const userRefreshToken = props?.zohoRefreshToken;
+    const refreshToken = userRefreshToken ?? this.env.ZOHO_REFRESH_TOKEN;
+    const accessToken = userRefreshToken ? undefined : this.env.ZOHO_ACCESS_TOKEN;
+
+    // A grant with no usable credentials (e.g. a stale passphrase grant in a
+    // multi-user-only deployment) must not 500 the session — register an empty,
+    // explanatory surface instead.
+    const hasCreds = !!accessToken || !!(refreshToken && this.env.ZOHO_CLIENT_ID && this.env.ZOHO_CLIENT_SECRET);
+    if (!hasCreds) {
+      this.server.registerTool(
+        "zoho_reauthorize_required",
+        {
+          description: "This connection has no usable Zoho credentials. Remove and re-add the connector to sign in again.",
+          inputSchema: {},
+          annotations: { title: "Re-authorize required", readOnlyHint: true, openWorldHint: false },
+        },
+        async () => ({
+          content: [{ type: "text", text: "No Zoho credentials for this grant. Reconnect the connector (Settings → Connectors)." }],
+          isError: true,
+        }),
+      );
+      return;
+    }
+
+    // Per-user cache namespace: in multi-user mode the schema cache MUST be keyed
+    // per grant, or one user's describe-workspace result would be served to
+    // another whose Zoho identity lacks access to that workspace.
+    const cachePrefix = userRefreshToken ? `u:${props?.user ?? "grant"}:` : "";
     const client = new ZohoAnalyticsClient({
       clientId: this.env.ZOHO_CLIENT_ID,
       clientSecret: this.env.ZOHO_CLIENT_SECRET,
-      refreshToken: userRefreshToken ?? this.env.ZOHO_REFRESH_TOKEN,
-      accessToken: userRefreshToken ? undefined : this.env.ZOHO_ACCESS_TOKEN,
+      refreshToken,
+      accessToken,
       orgId: this.env.ZOHO_ORG_ID,
       dc: this.env.ZOHO_DC,
       analyticsBaseUrl: this.env.ZOHO_ANALYTICS_BASE_URL,
@@ -80,8 +115,8 @@ export class ZohoAnalyticsMCP extends McpAgent<Env, unknown, Props> {
       readOnly: this.env.MCP_READONLY === "true",
       core: this.env.MCP_CORE === "true",
       cache: {
-        get: (key) => this.env.OAUTH_KV.get(key),
-        put: (key, value, ttlSecs) => this.env.OAUTH_KV.put(key, value, { expirationTtl: Math.max(60, ttlSecs) }),
+        get: (key) => this.env.OAUTH_KV.get(cachePrefix + key),
+        put: (key, value, ttlSecs) => this.env.OAUTH_KV.put(cachePrefix + key, value, { expirationTtl: Math.max(60, ttlSecs) }),
       },
     });
     registerResourcesAndPrompts(this.server, client);
@@ -119,9 +154,30 @@ function escapeHtml(s: string): string {
   );
 }
 
-/** Render the single-user passphrase consent screen. */
-function consentPage(reqInfo: AuthRequest, clientName: string, error: string | null): Response {
+/**
+ * Render the consent screen. mode="passphrase" (single-user) shows a passphrase
+ * field; mode="zoho" (multi-user) shows a "Continue to Zoho sign-in" button —
+ * the click is the explicit per-client approval that prevents a confused-deputy
+ * grant (an attacker-registered MCP client cannot silently capture a victim's
+ * Zoho grant, because the victim sees WHICH client is asking and must consent).
+ */
+function consentPage(
+  reqInfo: AuthRequest,
+  clientName: string,
+  error: string | null,
+  mode: "passphrase" | "zoho" = "passphrase",
+): Response {
   const req = b64encodeUtf8(JSON.stringify(reqInfo));
+  const field =
+    mode === "zoho"
+      ? ""
+      : `<label for="p">Passphrase</label>
+    <input id="p" name="passphrase" type="password" autocomplete="current-password" autofocus required>`;
+  const buttonText = mode === "zoho" ? "Continue to Zoho sign-in" : "Authorize";
+  const foot =
+    mode === "zoho"
+      ? "You'll sign in with your own Zoho account · this app will act as you"
+      : "Single-user connector · enter your passphrase to continue";
   const html = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -145,12 +201,11 @@ function consentPage(reqInfo: AuthRequest, clientName: string, error: string | n
   <form class="card" method="POST" action="/authorize">
     <h1>Authorize access</h1>
     <p><span class="client">${escapeHtml(clientName || "An application")}</span> wants to connect to your Zoho Analytics MCP server.</p>
-    <label for="p">Passphrase</label>
-    <input id="p" name="passphrase" type="password" autocomplete="current-password" autofocus required>
+    ${field}
     <input type="hidden" name="req" value="${req}">
-    <button type="submit">Authorize</button>
+    <button type="submit">${buttonText}</button>
     ${error ? `<p class="err">${escapeHtml(error)}</p>` : ""}
-    <p class="foot">Single-user connector · enter your passphrase to continue</p>
+    <p class="foot">${foot}</p>
   </form>
 </body></html>`;
   return new Response(html, {
@@ -266,16 +321,21 @@ async function handleZohoCallback(request: Request, env: Env): Promise<Response>
   }
 
   const user = crypto.randomUUID();
-  const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
-    request: reqInfo,
-    userId: user,
-    metadata: {},
-    scope: reqInfo.scope ?? [],
-    // Props are stored encrypted by the OAuth provider — the user's refresh
-    // token never appears in plaintext KV.
-    props: { user, zohoRefreshToken: data.refresh_token } satisfies Props,
-  });
-  return Response.redirect(redirectTo, 302);
+  try {
+    const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+      request: reqInfo,
+      userId: user,
+      metadata: {},
+      scope: reqInfo.scope ?? [],
+      // Props are stored encrypted by the OAuth provider — the user's refresh
+      // token never appears in plaintext KV.
+      props: { user, zohoRefreshToken: data.refresh_token } satisfies Props,
+    });
+    return Response.redirect(redirectTo, 302);
+  } catch {
+    // The MCP auth request expired/was tampered between login start and callback.
+    return new Response("Authorization could not be completed — retry connecting.", { status: 400 });
+  }
 }
 
 async function handleAuthorize(request: Request, env: Env): Promise<Response> {
@@ -287,8 +347,9 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
       return new Response("Invalid OAuth request", { status: 400 });
     }
     if (!reqInfo.clientId) return new Response("Invalid OAuth request", { status: 400 });
-    if (multiUserEnabled(env)) return startZohoLogin(reqInfo, request, env);
-    return consentPage(reqInfo, await clientName(env, reqInfo.clientId), null);
+    // Both modes show a consent screen first (displaying the requesting client),
+    // so the user explicitly approves THIS client before anything proceeds.
+    return consentPage(reqInfo, await clientName(env, reqInfo.clientId), null, multiUserEnabled(env) ? "zoho" : "passphrase");
   }
 
   if (request.method === "POST") {
@@ -302,6 +363,11 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
       return new Response("Invalid OAuth request", { status: 400 });
     }
     if (!reqInfo.clientId) return new Response("Invalid OAuth request", { status: 400 });
+
+    // Multi-user: the consent POST IS the per-client approval — now hand off to
+    // Zoho's own login. The passphrase path below is never reachable in this
+    // mode, so a shared secret can't bypass the per-user Zoho login.
+    if (multiUserEnabled(env)) return startZohoLogin(reqInfo, request, env);
 
     const ip = clientIp(request);
     if (await isLockedOut(env, ip)) {

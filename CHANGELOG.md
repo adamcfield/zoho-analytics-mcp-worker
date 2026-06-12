@@ -26,7 +26,9 @@ Built for the project's end goal: a tool surface a Sonnet-class assistant uses e
 
 ### Operations
 - **Per-IP rate limiting** via the Workers rate-limit binding (300 req/min; flood-cost cap).
-- **Per-tool usage telemetry** via Workers Analytics Engine (`zoho_mcp_usage` dataset).
+- **Per-tool usage telemetry** via Workers Analytics Engine (`zoho_mcp_usage` dataset). Binding
+  ships commented out — requires one-time Analytics Engine enablement on the account (like R2);
+  the code degrades gracefully while off.
 - **Schema caching:** `zoho_describe_workspace` serves from a 5-min KV cache (API-unit saver).
 - **Deploy pipeline armed:** `MCP_URL` + `MCP_AUTH_TOKEN` repo secrets set; deploy.yml runs a live
   smoke post-deploy (CLOUDFLARE_API_TOKEN remains the one manual repo secret).

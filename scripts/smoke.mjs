@@ -88,16 +88,18 @@ await rpc({ jsonrpc: "2.0", method: "notifications/initialized" });
 const list = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" });
 const tools = list.body?.result?.tools ?? [];
 const has = (t) => tools.some((x) => x.name === t);
-// Detect deployment mode: MCP_READONLY (no write tools) or MCP_CORE (~26 curated tools).
+// Independent flags: MCP_CORE trims to ~26 curated tools; MCP_READONLY drops all
+// write tools. Both can be set together (~18 reads). Detect each on its own.
+const core = tools.length < 60; // full=~144, readonly=~51, core=~26, readonly+core=~18
 const readonly = !WRITE_TOOLS.some(has);
-const core = !readonly && tools.length < 60;
-if (readonly) console.log("note: read-only deployment detected — skipping write-tool checks");
 if (core) console.log("note: MCP_CORE deployment detected (~26 curated tools)");
-// Full deploy registers ~144 tools; MCP_READONLY trims to ~51 reads; MCP_CORE to ~26.
-check("tools/list", tools.length >= (readonly ? 40 : core ? 20 : 130), `(${tools.length} tools)`);
-const CORE_SUBSET = ["zoho_whoami", "zoho_list_workspaces", "zoho_describe_workspace", "zoho_query_data", "zoho_add_row", "zoho_import_data"];
-for (const t of core ? CORE_SUBSET : READ_TOOLS) check(`tool present: ${t}`, has(t));
-if (!readonly && !core) for (const t of WRITE_TOOLS) check(`tool present: ${t}`, has(t));
+if (readonly) console.log("note: read-only deployment detected — skipping write-tool checks");
+const minTools = core ? (readonly ? 12 : 20) : readonly ? 40 : 130;
+check("tools/list", tools.length >= minTools, `(${tools.length} tools)`);
+// Read tools present in EVERY mode (core, readonly, and both).
+const ALWAYS_READS = ["zoho_whoami", "zoho_list_workspaces", "zoho_describe_workspace", "zoho_query_data", "zoho_export_data"];
+for (const t of core ? ALWAYS_READS : READ_TOOLS) check(`tool present: ${t}`, has(t));
+if (!readonly) for (const t of (core ? ["zoho_add_row", "zoho_import_data", "zoho_create_table"] : WRITE_TOOLS)) check(`tool present: ${t}`, has(t));
 
 const resources = await rpc({ jsonrpc: "2.0", id: 4, method: "resources/list" });
 check("resources/list (zoho://workspaces)", (resources.body?.result?.resources ?? []).some((r) => r.uri === "zoho://workspaces"));

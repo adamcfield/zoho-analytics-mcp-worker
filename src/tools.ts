@@ -463,7 +463,10 @@ export function registerTools(
           truncated: all.length > described.length,
           views: described,
         };
-        if (opts.cache) {
+        // Don't pin a transiently-degraded map (a 429/5xx on some per-view column
+        // fetch) for 5 minutes — only cache when every described view is clean.
+        const allClean = described.every((v) => !("columns_error" in v));
+        if (opts.cache && allClean) {
           try {
             await opts.cache.put(cacheKey, JSON.stringify(result), 300);
           } catch {

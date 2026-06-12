@@ -125,7 +125,7 @@ export function integrationsFromEnv(env: Env): Pick<RegisterToolsOptions, "track
 }
 
 export class ZohoAnalyticsMCP extends McpAgent<Env> {
-  server = new McpServer({ name: "zoho-analytics", version: "1.6.0" });
+  server = new McpServer({ name: "zoho-analytics", version: "1.6.1" });
 
   async init(): Promise<void> {
     const client = clientFromEnv(this.env);
@@ -188,7 +188,12 @@ export default {
 
     // Signed export downloads (capability URL — the HMAC in the query IS the auth).
     if (request.method === "GET" && url.pathname.startsWith("/download/") && env.EXPORTS && env.MCP_AUTH_TOKEN) {
-      const key = decodeURIComponent(url.pathname.slice("/download/".length));
+      let key: string;
+      try {
+        key = decodeURIComponent(url.pathname.slice("/download/".length));
+      } catch {
+        return new Response("Invalid download link", { status: 400 }); // malformed %-encoding
+      }
       const exp = Number(url.searchParams.get("exp"));
       const sig = url.searchParams.get("sig") ?? "";
       if (!key.startsWith("exp/") || !(await verifyDownloadToken(key, exp, sig, env.MCP_AUTH_TOKEN))) {
@@ -198,7 +203,13 @@ export default {
       if (!obj) return new Response("Export not found (expired)", { status: 404 });
       return new Response(obj.body, {
         status: 200,
-        headers: { "content-type": obj.httpMetadata?.contentType ?? "application/octet-stream" },
+        headers: {
+          "content-type": obj.httpMetadata?.contentType ?? "application/octet-stream",
+          // Org data behind a capability URL: don't let browsers cache it past
+          // link expiry, and don't let the browser sniff a different type.
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+        },
       });
     }
 
