@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.6.0 — Everyday-consumer release (all 12 improvement items)
+
+Built for the project's end goal: a tool surface a Sonnet-class assistant uses every day.
+
+### Live-demo evidence fixes
+- `readableViewType` accepts the name strings Zoho actually returns live (no more "type AnalysisView").
+- `zoho_query_data` description now teaches Zoho's SQL dialect (quote identifiers; alias aggregates —
+  they're forbidden inside ORDER BY/GROUP BY/WHERE; non-aggregated SELECT columns must be grouped).
+- Export tools document that PII-flagged columns are silently excluded from exports.
+- Query default wait raised to 50s (cap 120s) — Zoho jobs routinely take 30-90s.
+
+### New capability
+- **MCP_CORE mode:** `MCP_CORE=true` registers only the curated ~26 everyday tools (discovery,
+  schema, SQL, row CRUD, import) — materially better tool selection for daily LLM use.
+- **MCP resources + prompts:** `zoho://workspaces` resource; `profile-workspace` and
+  `analytics-question` prompts that encode the proven workflows (incl. the SQL dialect rules).
+- **Export spill to R2 (optional):** truncated export results persist the FULL body to R2 and
+  return a 24h HMAC-signed `/download/...` capability URL — nothing lost to inline caps.
+  (Binding ships commented out: requires one-time R2 enablement on the Cloudflare account.)
+- **Multi-user mode (optional, OAuth worker):** `ZOHO_MULTI_USER=true` replaces the shared
+  passphrase with a real per-user Zoho login (authorization-code flow); each user's refresh token
+  lives in the encrypted OAuth grant props and access tokens are cached per grant. Requires a
+  server-based Zoho client with redirect `<origin>/zoho/callback`.
+
+### Operations
+- **Per-IP rate limiting** via the Workers rate-limit binding (300 req/min; flood-cost cap).
+- **Per-tool usage telemetry** via Workers Analytics Engine (`zoho_mcp_usage` dataset).
+- **Schema caching:** `zoho_describe_workspace` serves from a 5-min KV cache (API-unit saver).
+- **Deploy pipeline armed:** `MCP_URL` + `MCP_AUTH_TOKEN` repo secrets set; deploy.yml runs a live
+  smoke post-deploy (CLOUDFLARE_API_TOKEN remains the one manual repo secret).
+- **scripts/live-test.mjs:** guarded live WRITE-path integration test — creates a disposable
+  table, inserts/queries real rows, dry-runs destructive tools, validates the divergent-path
+  reads (email schedules, datasources), then trashes + permanently deletes its table.
+
+62 unit tests (token-store namespacing, signed-URL verify/tamper/expiry, view-type names).
+
 ## 1.5.2 — Final sweep (dry: 3 nits, zero behavioral findings)
 
 The final full-coverage sweep confirmed zero critical/major/minor findings — only 3 cosmetic

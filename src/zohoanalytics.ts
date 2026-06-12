@@ -76,6 +76,49 @@ export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeou
 /** Encode a caller-supplied id before it is interpolated into an API path. */
 const enc = encodeURIComponent;
 
+/** Length-safe constant-time string comparison (shared by auth gates and signed URLs). */
+export function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return mismatch === 0;
+}
+
+// ---- Signed capability URLs for R2 export spill ----
+// Oversized export results are stored in R2 and returned as a time-limited
+// signed URL instead of flooding the LLM context. The signature is an HMAC over
+// `key:exp` with the worker's bearer secret, so the URL itself is the capability
+// (no Authorization header needed when fetching it).
+
+async function hmacHex(secret: string, message: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Sign an export-download key valid until `expEpochSecs`. */
+export function signDownloadToken(key: string, expEpochSecs: number, secret: string): Promise<string> {
+  return hmacHex(secret, `${key}:${expEpochSecs}`);
+}
+
+/** Verify a signed download URL's key/exp/sig triple. */
+export async function verifyDownloadToken(
+  key: string,
+  expEpochSecs: number,
+  sig: string,
+  secret: string,
+): Promise<boolean> {
+  if (!Number.isFinite(expEpochSecs) || Date.now() / 1000 > expEpochSecs) return false;
+  const expected = await signDownloadToken(key, expEpochSecs, secret);
+  return constantTimeEqual(expected, sig);
+}
+
 /**
  * Cross-instance access-token cache. Each MCP session runs in its own Durable
  * Object with its own client, so without a shared store every new session mints
@@ -87,12 +130,19 @@ export interface TokenStore {
   set(token: string, expiry: number): Promise<void>;
 }
 
-/** TokenStore backed by a Workers KV namespace (structurally typed; pass any KV binding). */
-export function kvTokenStore(kv: {
-  get(key: string, type: "json"): Promise<unknown>;
-  put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>;
-}): TokenStore {
-  const KEY = "zoho-analytics:access-token";
+/**
+ * TokenStore backed by a Workers KV namespace (structurally typed; pass any KV
+ * binding). `keySuffix` namespaces the cache — in multi-user mode each user's
+ * Zoho access token must be cached separately, never shared.
+ */
+export function kvTokenStore(
+  kv: {
+    get(key: string, type: "json"): Promise<unknown>;
+    put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>;
+  },
+  keySuffix = "",
+): TokenStore {
+  const KEY = `zoho-analytics:access-token${keySuffix ? `:${keySuffix}` : ""}`;
   return {
     async get() {
       try {

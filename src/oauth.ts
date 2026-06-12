@@ -26,8 +26,8 @@ import OAuthProvider from "@cloudflare/workers-oauth-provider";
 import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ZohoAnalyticsClient, kvTokenStore } from "./zohoanalytics.js";
-import { registerTools } from "./tools.js";
+import { ZohoAnalyticsClient, kvTokenStore, DC_DOMAINS } from "./zohoanalytics.js";
+import { registerTools, registerResourcesAndPrompts } from "./tools.js";
 
 // Reuses the bearer worker's global Cloudflare.Env (MCP_OBJECT, ZOHO_*, etc.)
 // and adds the OAuth-specific bindings.
@@ -36,35 +36,55 @@ interface Env extends Cloudflare.Env {
   /** Injected by OAuthProvider. */
   OAUTH_PROVIDER: OAuthHelpers;
   APP_PASSPHRASE: string;
+  /**
+   * "true" => MULTI-USER mode: the consent screen becomes a real Zoho login
+   * (authorization-code flow). Each user's own Zoho refresh token is stored in
+   * the encrypted OAuth grant props, so every action runs as — and is audited
+   * to — that user. Requires a SERVER-BASED Zoho API client (Self Clients
+   * cannot have redirect URIs) with redirect URI <origin>/zoho/callback, whose
+   * id/secret go in ZOHO_CLIENT_ID / ZOHO_CLIENT_SECRET. When unset/false, the
+   * single-user shared-passphrase consent is used.
+   */
+  ZOHO_MULTI_USER?: string;
 }
 
-type Props = { user: string };
+type Props = { user: string; zohoRefreshToken?: string };
 type AuthRequest = Awaited<ReturnType<OAuthHelpers["parseAuthRequest"]>>;
 
 /** The MCP agent — identical tool surface to the bearer worker. */
 export class ZohoAnalyticsMCP extends McpAgent<Env, unknown, Props> {
-  server = new McpServer({ name: "zoho-analytics", version: "1.5.3" });
+  server = new McpServer({ name: "zoho-analytics", version: "1.6.0" });
 
   async init(): Promise<void> {
+    // Multi-user grants carry the user's own refresh token in (encrypted) props;
+    // single-user grants fall back to the worker-wide secret.
+    const props = this.props as Props | undefined;
+    const userRefreshToken = props?.zohoRefreshToken;
     const client = new ZohoAnalyticsClient({
       clientId: this.env.ZOHO_CLIENT_ID,
       clientSecret: this.env.ZOHO_CLIENT_SECRET,
-      refreshToken: this.env.ZOHO_REFRESH_TOKEN,
-      accessToken: this.env.ZOHO_ACCESS_TOKEN,
+      refreshToken: userRefreshToken ?? this.env.ZOHO_REFRESH_TOKEN,
+      accessToken: userRefreshToken ? undefined : this.env.ZOHO_ACCESS_TOKEN,
       orgId: this.env.ZOHO_ORG_ID,
       dc: this.env.ZOHO_DC,
       analyticsBaseUrl: this.env.ZOHO_ANALYTICS_BASE_URL,
       accountsBaseUrl: this.env.ZOHO_ACCOUNTS_BASE_URL,
       maxRetries: this.env.ZOHO_MAX_RETRIES ? Number(this.env.ZOHO_MAX_RETRIES) : undefined,
-      // Share one Zoho access token across all sessions via the OAuth KV —
-      // Zoho caps token creation (~10 per 10 min per refresh token).
-      tokenStore: kvTokenStore(this.env.OAUTH_KV),
+      // Cached access tokens are namespaced per grant in multi-user mode —
+      // users must never share access tokens. Zoho caps mints ~10/10min/token.
+      tokenStore: kvTokenStore(this.env.OAUTH_KV, userRefreshToken ? (props?.user ?? "grant") : ""),
     });
     registerTools(this.server, client, {
       orgId: this.env.ZOHO_ORG_ID,
       dc: this.env.ZOHO_DC ?? "com",
       readOnly: this.env.MCP_READONLY === "true",
+      core: this.env.MCP_CORE === "true",
+      cache: {
+        get: (key) => this.env.OAUTH_KV.get(key),
+        put: (key, value, ttlSecs) => this.env.OAUTH_KV.put(key, value, { expirationTtl: Math.max(60, ttlSecs) }),
+      },
     });
+    registerResourcesAndPrompts(this.server, client);
   }
 }
 
@@ -190,6 +210,74 @@ async function recordFailedAttempt(env: Env, ip: string): Promise<void> {
   }
 }
 
+// ---- Multi-user mode: real Zoho login on consent ----
+
+const multiUserEnabled = (env: Env): boolean =>
+  env.ZOHO_MULTI_USER === "true" && !!env.ZOHO_CLIENT_ID && !!env.ZOHO_CLIENT_SECRET;
+
+function zohoAccountsOrigin(env: Env): string {
+  if (env.ZOHO_ACCOUNTS_BASE_URL) return env.ZOHO_ACCOUNTS_BASE_URL.replace(/\/+$/, "");
+  const dc = (env.ZOHO_DC ?? "com").toLowerCase();
+  return `https://${(DC_DOMAINS[dc] ?? DC_DOMAINS.com).accounts}`;
+}
+
+/** Multi-user: park the MCP auth request in KV and send the user to Zoho's login/consent. */
+async function startZohoLogin(reqInfo: AuthRequest, request: Request, env: Env): Promise<Response> {
+  const state = crypto.randomUUID();
+  await env.OAUTH_KV.put(`authreq:${state}`, JSON.stringify(reqInfo), { expirationTtl: 600 });
+  const redirectUri = `${new URL(request.url).origin}/zoho/callback`;
+  const auth = new URL(`${zohoAccountsOrigin(env)}/oauth/v2/auth`);
+  auth.searchParams.set("scope", "ZohoAnalytics.fullaccess.all");
+  auth.searchParams.set("client_id", env.ZOHO_CLIENT_ID!);
+  auth.searchParams.set("response_type", "code");
+  auth.searchParams.set("access_type", "offline");
+  auth.searchParams.set("prompt", "consent"); // ensures a refresh_token on every grant
+  auth.searchParams.set("redirect_uri", redirectUri);
+  auth.searchParams.set("state", state);
+  return Response.redirect(auth.toString(), 302);
+}
+
+/** Multi-user: Zoho redirected back — exchange the code and finish the MCP grant. */
+async function handleZohoCallback(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state") ?? "";
+  const stored = state ? await env.OAUTH_KV.get(`authreq:${state}`) : null;
+  if (!code || !stored) return new Response("Login expired or invalid — retry connecting.", { status: 400 });
+  await env.OAUTH_KV.delete(`authreq:${state}`);
+  const reqInfo = JSON.parse(stored) as AuthRequest;
+
+  // Exchange at Zoho (credentials in the POST body, never the URL).
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    client_id: env.ZOHO_CLIENT_ID!,
+    client_secret: env.ZOHO_CLIENT_SECRET!,
+    redirect_uri: `${url.origin}/zoho/callback`,
+    code,
+  });
+  const res = await fetch(`${zohoAccountsOrigin(env)}/oauth/v2/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  });
+  const data = (await res.json().catch(() => ({}))) as { refresh_token?: string; error?: string };
+  if (!data.refresh_token) {
+    return new Response(`Zoho login failed: ${data.error ?? `HTTP ${res.status}`}. Retry connecting.`, { status: 502 });
+  }
+
+  const user = crypto.randomUUID();
+  const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+    request: reqInfo,
+    userId: user,
+    metadata: {},
+    scope: reqInfo.scope ?? [],
+    // Props are stored encrypted by the OAuth provider — the user's refresh
+    // token never appears in plaintext KV.
+    props: { user, zohoRefreshToken: data.refresh_token } satisfies Props,
+  });
+  return Response.redirect(redirectTo, 302);
+}
+
 async function handleAuthorize(request: Request, env: Env): Promise<Response> {
   if (request.method === "GET") {
     let reqInfo: AuthRequest;
@@ -199,6 +287,7 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
       return new Response("Invalid OAuth request", { status: 400 });
     }
     if (!reqInfo.clientId) return new Response("Invalid OAuth request", { status: 400 });
+    if (multiUserEnabled(env)) return startZohoLogin(reqInfo, request, env);
     return consentPage(reqInfo, await clientName(env, reqInfo.clientId), null);
   }
 
@@ -246,6 +335,7 @@ const defaultHandler = {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/authorize") return handleAuthorize(request, env);
+    if (url.pathname === "/zoho/callback" && multiUserEnabled(env)) return handleZohoCallback(request, env);
     if (url.pathname === "/" && request.method === "GET") {
       return new Response("zoho-analytics-mcp-oauth worker: ok (OAuth-gated MCP at /mcp)", {
         status: 200,

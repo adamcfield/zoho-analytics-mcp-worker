@@ -9,7 +9,27 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ZohoAnalyticsMCP"] }],
   // Shares one Zoho access token across all MCP sessions (Zoho caps token
-  // creation at ~10 per 10 min per refresh token).
+  // creation at ~10 per 10 min per refresh token). Also backs the schema cache.
   "kv_namespaces": [{ "binding": "TOKEN_KV", "id": "7bd00e7a3c1e4accabce08ca35d9ef35" }],
+  // Optional export spill: oversized results stored in R2, returned as 24h
+  // signed URLs. Requires one-time R2 enablement in the Cloudflare dashboard,
+  // then: wrangler r2 bucket create zoho-mcp-exports
+  //       wrangler r2 bucket lifecycle add zoho-mcp-exports --name expire-exports --expire-days 1 --prefix exp/
+  // and uncomment (the code degrades gracefully while this is off):
+  // "r2_buckets": [{ "binding": "EXPORTS", "bucket_name": "zoho-mcp-exports" }],
+  // Optional per-tool usage telemetry. Requires one-time Analytics Engine
+  // enablement (dash.cloudflare.com -> Workers -> Analytics Engine), then
+  // uncomment (the code degrades gracefully while this is off):
+  // "analytics_engine_datasets": [{ "binding": "USAGE", "dataset": "zoho_mcp_usage" }],
+  // Per-IP request flood cap (the bearer token itself is brute-force-infeasible).
+  "unsafe": {
+    "bindings": [
+      { "name": "RATE_LIMITER", "type": "ratelimit", "namespace_id": "1001", "simple": { "limit": 300, "period": 60 } }
+    ]
+  },
+  "vars": {
+    // Public origin used to build signed /download URLs for spilled exports.
+    "PUBLIC_BASE_URL": "https://zoho-analytics-mcp.adamcfield.workers.dev"
+  },
   "observability": { "enabled": true }
 }

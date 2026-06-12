@@ -1,5 +1,12 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { ZohoAnalyticsClient, ZohoAnalyticsError, mapLimit } from "../src/zohoanalytics.js";
+import {
+  ZohoAnalyticsClient,
+  ZohoAnalyticsError,
+  mapLimit,
+  kvTokenStore,
+  signDownloadToken,
+  verifyDownloadToken,
+} from "../src/zohoanalytics.js";
 
 /** Client using a static access token — skips the OAuth refresh roundtrip. */
 const mkStatic = () =>
@@ -521,6 +528,42 @@ describe("sweep round 1 regressions", () => {
     vi.stubGlobal("fetch", f);
     await mkStatic().getDatasources("W");
     expect(String(f.mock.calls[0][0])).toMatch(/\/workspaces\/W\/datasources$/);
+  });
+});
+
+describe("v1.6.0 additions", () => {
+  it("kvTokenStore namespaces keys per user suffix", async () => {
+    const store: Record<string, string> = {};
+    const kv = {
+      get: async (k: string) => (store[k] ? JSON.parse(store[k]) : null),
+      put: async (k: string, v: string) => {
+        store[k] = v;
+      },
+    } as never;
+    const a = kvTokenStore(kv, "userA");
+    const b = kvTokenStore(kv, "userB");
+    const shared = kvTokenStore(kv);
+    await a.set("TA", Date.now() + 3_000_000);
+    await b.set("TB", Date.now() + 3_000_000);
+    expect((await a.get())?.token).toBe("TA");
+    expect((await b.get())?.token).toBe("TB");
+    expect(await shared.get()).toBeNull(); // un-suffixed key untouched
+    expect(Object.keys(store).sort()).toEqual([
+      "zoho-analytics:access-token:userA",
+      "zoho-analytics:access-token:userB",
+    ]);
+  });
+
+  it("signed download tokens verify, reject tampering, and expire", async () => {
+    const exp = Math.floor(Date.now() / 1000) + 60;
+    const sig = await signDownloadToken("exp/abc", exp, "secret");
+    expect(await verifyDownloadToken("exp/abc", exp, sig, "secret")).toBe(true);
+    expect(await verifyDownloadToken("exp/OTHER", exp, sig, "secret")).toBe(false); // key tamper
+    expect(await verifyDownloadToken("exp/abc", exp + 1, sig, "secret")).toBe(false); // exp tamper
+    expect(await verifyDownloadToken("exp/abc", exp, sig, "wrong")).toBe(false); // wrong secret
+    const past = Math.floor(Date.now() / 1000) - 10;
+    const oldSig = await signDownloadToken("exp/abc", past, "secret");
+    expect(await verifyDownloadToken("exp/abc", past, oldSig, "secret")).toBe(false); // expired
   });
 });
 

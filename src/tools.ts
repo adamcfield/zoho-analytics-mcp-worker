@@ -80,8 +80,14 @@ function audit(action: string, meta: Record<string, unknown>): void {
 
 // ---- Helpers shared by the tools (exported for unit tests) ----
 
-export const readableViewType = (code?: string | number): string =>
-  VIEW_TYPE_NAMES[String(code ?? "")] ?? `type ${code ?? "unknown"}`;
+// Zoho's docs describe viewType as a numeric code, but live responses can carry
+// name strings ("Table", "AnalysisView", "Dashboard") — accept both.
+export const readableViewType = (code?: string | number): string => {
+  const s = String(code ?? "");
+  if (VIEW_TYPE_NAMES[s]) return VIEW_TYPE_NAMES[s];
+  if (s && /^[A-Za-z][A-Za-z ]*$/.test(s)) return s; // already a readable name
+  return `type ${code ?? "unknown"}`;
+};
 
 /** Trim a view object to the fields that matter (keeps LLM context small). */
 export function compactView(v: AnyRec): AnyRec {
@@ -171,7 +177,58 @@ export interface RegisterToolsOptions {
   dc?: string;
   /** When true, write/state-changing tools are not registered at all (reporting-only deploys). */
   readOnly?: boolean;
+  /**
+   * When true, register only the curated ~26 workhorse tools (MCP_CORE).
+   * Smaller tool surface = better tool selection for everyday LLM consumers.
+   */
+  core?: boolean;
+  /** Optional per-tool-call usage hook (tool name + success), e.g. Workers Analytics Engine. */
+  track?: (tool: string, ok: boolean) => void;
+  /** Optional short-TTL cache for expensive metadata reads (KV-backed). */
+  cache?: {
+    get(key: string): Promise<string | null>;
+    put(key: string, value: string, ttlSecs: number): Promise<void>;
+  };
+  /** Optional spill store: oversized export bodies become time-limited signed URLs instead of truncation. */
+  exportStore?: {
+    save(body: string, contentType: string): Promise<{ url: string; expires_at: string }>;
+  };
 }
+
+/**
+ * The curated everyday surface (MCP_CORE=true): discovery, schema, SQL/query,
+ * row CRUD, and import — the tools an assistant reaches for daily. Everything
+ * else (sharing, users, publish, slides, variables, AutoML, …) stays available
+ * on full deploys.
+ */
+const CORE_TOOLS = new Set([
+  "zoho_whoami",
+  "zoho_get_orgs",
+  "zoho_list_workspaces",
+  "zoho_get_workspace_details",
+  "zoho_list_views",
+  "zoho_get_view_details",
+  "zoho_get_view_metadata",
+  "zoho_get_metadata",
+  "zoho_describe_workspace",
+  "zoho_list_folders",
+  "zoho_export_data",
+  "zoho_query_data",
+  "zoho_create_export_job",
+  "zoho_get_export_job",
+  "zoho_get_import_job",
+  "zoho_add_row",
+  "zoho_update_rows",
+  "zoho_delete_rows",
+  "zoho_import_data",
+  "zoho_create_table",
+  "zoho_create_table_from_data",
+  "zoho_create_query_table",
+  "zoho_get_query_table",
+  "zoho_edit_query_table",
+  "zoho_get_dependents",
+  "zoho_list_users",
+]);
 
 /** Register all Zoho Analytics tools onto the given MCP server. */
 export function registerTools(
@@ -179,13 +236,33 @@ export function registerTools(
   client: ZohoAnalyticsClient,
   opts: RegisterToolsOptions = {},
 ): void {
-  // Register a write/state-changing tool — a no-op when the server is read-only
-  // (MCP_READONLY), so those tools never even appear in tools/list. Typed as the
-  // real method so handler arg inference from the Zod inputSchema is preserved.
+  // Central registration gate: applies the MCP_CORE filter and wraps every
+  // handler with the optional usage hook. Typed as the real method so handler
+  // arg inference from the Zod inputSchema is preserved.
+  const instrument = (register: McpServer["registerTool"]): McpServer["registerTool"] =>
+    ((name: string, cfg: unknown, handler: (...a: unknown[]) => Promise<ToolResult>) => {
+      if (opts.core && !CORE_TOOLS.has(name)) return undefined;
+      const wrapped = async (...args: unknown[]): Promise<ToolResult> => {
+        const out = await handler(...args);
+        try {
+          opts.track?.(name, out?.isError !== true);
+        } catch {
+          /* telemetry must never break a tool call */
+        }
+        return out;
+      };
+      return register(name as never, cfg as never, wrapped as never);
+    }) as McpServer["registerTool"];
+
+  // Reads register through readTool; writes through writeTool — a no-op when the
+  // server is read-only (MCP_READONLY), so those tools never appear in tools/list.
   const noop = (() => undefined) as unknown as McpServer["registerTool"];
+  const readTool: McpServer["registerTool"] = instrument(
+    server.registerTool.bind(server) as McpServer["registerTool"],
+  );
   const writeTool: McpServer["registerTool"] = opts.readOnly
     ? noop
-    : (server.registerTool.bind(server) as McpServer["registerTool"]);
+    : instrument(server.registerTool.bind(server) as McpServer["registerTool"]);
 
   // Merge advanced/passthrough CONFIG keys into a base config object. Options
   // merge FIRST: explicit schema-validated params always win, so a passthrough
@@ -200,7 +277,7 @@ export function registerTools(
 
   // ============================ Reads ============================
 
-  server.registerTool(
+  readTool(
     "zoho_whoami",
     {
       description:
@@ -220,7 +297,7 @@ export function registerTools(
       }),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_orgs",
     {
       description:
@@ -231,7 +308,7 @@ export function registerTools(
     async () => run(() => client.getOrgs()),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_list_workspaces",
     {
       description:
@@ -265,7 +342,7 @@ export function registerTools(
       }),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_workspace_details",
     {
       description: "Get details of a single workspace by id (name, description, owner, created time, org).",
@@ -275,7 +352,7 @@ export function registerTools(
     async ({ workspace_id }) => run(() => client.getWorkspaceDetails(workspace_id)),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_list_views",
     {
       description:
@@ -309,7 +386,7 @@ export function registerTools(
       }),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_view_details",
     {
       description:
@@ -324,7 +401,7 @@ export function registerTools(
       run(() => client.getViewDetails(view_id, with_columns === false ? undefined : { withInvolvedMetaInfo: true })),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_metadata",
     {
       description:
@@ -338,7 +415,7 @@ export function registerTools(
     async ({ workspace_name, view_name }) => run(() => client.getMetaDetails(workspace_name, view_name)),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_describe_workspace",
     {
       description:
@@ -353,6 +430,17 @@ export function registerTools(
     },
     async ({ workspace_id, include_columns, max_views, concurrency }) =>
       run(async () => {
+        // Schema maps are expensive (1 + N API calls) and change rarely — serve
+        // from the short-TTL cache when available to save API units.
+        const cacheKey = `zoho-cache:describe:${workspace_id}:${include_columns !== false}:${max_views ?? 50}`;
+        if (opts.cache) {
+          try {
+            const hit = await opts.cache.get(cacheKey);
+            if (hit) return { ...JSON.parse(hit), cached: true };
+          } catch {
+            /* cache misses must never break the tool */
+          }
+        }
         const res = (await client.getViews(workspace_id)) as AnyRec;
         const all: AnyRec[] = res?.data?.views ?? res?.data ?? [];
         const views = all.slice(0, max_views ?? 50);
@@ -368,21 +456,29 @@ export function registerTools(
             return { ...base, columns: [], columns_error: e instanceof ZohoAnalyticsError ? `API ${e.status}` : String(e) };
           }
         });
-        return {
+        const result = {
           workspace_id,
           view_count: all.length,
           described: described.length,
           truncated: all.length > described.length,
           views: described,
         };
+        if (opts.cache) {
+          try {
+            await opts.cache.put(cacheKey, JSON.stringify(result), 300);
+          } catch {
+            /* best-effort */
+          }
+        }
+        return result;
       }),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_export_data",
     {
       description:
-        "Export the rows of a table/view SYNCHRONOUSLY and return them as parsed rows (response_format=json, default) — the quick way to read a whole table or a filtered slice. Use `criteria` to filter and `selected_columns` to project. NOT allowed for views over 1,000,000 rows, live-connect workspaces, or Dashboard/Query-Table views — use zoho_query_data or zoho_create_export_job for those. Caps returned rows at max_rows.",
+        "Export the rows of a table/view SYNCHRONOUSLY and return them as parsed rows (response_format=json, default) — the quick way to read a whole table or a filtered slice. Use `criteria` to filter and `selected_columns` to project. NOT allowed for views over 1,000,000 rows, live-connect workspaces, or Dashboard/Query-Table views — use zoho_query_data or zoho_create_export_job for those. NOTE: columns marked PII in Zoho are silently excluded from exports. Caps returned rows at max_rows.",
       inputSchema: {
         workspace_id: z.string().describe("Workspace id."),
         view_id: z.string().describe("View/table id."),
@@ -417,16 +513,16 @@ export function registerTools(
       }),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_query_data",
     {
       description:
-        "Run an ad-hoc SQL SELECT against a workspace and return the result rows. This is the headline analytics tool. Under the hood it creates an async bulk export job from your SQL, polls it to completion, downloads the result, and parses it. Use standard SQL with double-quoted table/column names, e.g. SELECT \"Region\", SUM(\"Sales\") FROM \"Orders\" GROUP BY \"Region\". For very large results that may exceed the wait window, use zoho_create_export_job + zoho_get_export_job instead. Caps returned rows at max_rows.",
+        "Run an ad-hoc SQL SELECT against a workspace and return the result rows. This is the headline analytics tool. Under the hood it creates an async bulk export job from your SQL, polls it to completion, downloads the result, and parses it. ZOHO SQL DIALECT RULES: double-quote ALL table/column names; aggregates (COUNT/SUM/MIN/MAX/AVG) are NOT allowed inside ORDER BY / GROUP BY / WHERE — alias the aggregate in SELECT and order by the alias (SELECT \"Region\", COUNT(*) AS \"N\" FROM \"Orders\" GROUP BY \"Region\" ORDER BY \"N\" DESC); every non-aggregated SELECT column must appear in GROUP BY. NOTE: columns marked PII in Zoho are silently EXCLUDED from exported rows (aggregating on them still works). Jobs routinely take 30-90s; if the wait window is exceeded you get a job_id to continue via zoho_get_export_job. Caps returned rows at max_rows.",
       inputSchema: {
         workspace_id: z.string().describe("Workspace id to run the query against."),
         sql_query: z.string().describe('SQL SELECT. Quote identifiers: SELECT "col" FROM "Table" WHERE ...'),
         max_rows: z.number().int().min(1).max(100000).optional().describe("Max rows to return (default 1000). Also consider LIMIT in SQL."),
-        timeout_seconds: z.number().int().min(1).max(60).optional().describe("Approximate max seconds to wait (default 30, cap 60; a slow status call can overrun slightly)."),
+        timeout_seconds: z.number().int().min(1).max(120).optional().describe("Approximate max seconds to wait (default 50, cap 120; Zoho jobs routinely take 30-90s)."),
       },
       annotations: { title: "Query data (SQL)", ...READ_ONLY },
     },
@@ -435,7 +531,7 @@ export function registerTools(
         const created = (await client.createExportJobBySql(workspace_id, sql_query, "json")) as AnyRec;
         const jobId = created?.data?.jobId ?? created?.jobId;
         if (!jobId) throw new Error(`Export job was not created: ${JSON.stringify(created)}`);
-        const deadline = Date.now() + Math.min(timeout_seconds ?? 30, 60) * 1000;
+        const deadline = Date.now() + Math.min(timeout_seconds ?? 50, 120) * 1000;
         const interval = 2000;
         for (;;) {
           const st = (await client.getExportJobStatus(workspace_id, String(jobId))) as AnyRec;
@@ -460,11 +556,29 @@ export function registerTools(
         const { rows, raw: rawJson } = parseExportRows(raw);
         if (rows.length === 0 && rawJson !== undefined) return { job_id: jobId, done: true, row_count: 0, raw: rawJson.slice(0, 50_000) };
         const { rows: out, truncated, total } = capRows(rows, max_rows ?? 1000);
-        return { job_id: jobId, done: true, row_count: total, returned: out.length, truncated, rows: out };
+        // Truncated result + spill store configured -> persist the FULL body and
+        // hand back a signed URL so nothing is lost to the inline cap.
+        let spill: { url: string; expires_at: string } | undefined;
+        if (truncated && opts.exportStore) {
+          try {
+            spill = await opts.exportStore.save(raw, "application/json");
+          } catch {
+            /* spill is best-effort; the capped rows still go back */
+          }
+        }
+        return {
+          job_id: jobId,
+          done: true,
+          row_count: total,
+          returned: out.length,
+          truncated,
+          ...(spill ? { full_result_url: spill.url, full_result_expires_at: spill.expires_at } : {}),
+          rows: out,
+        };
       }),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_create_export_job",
     {
       description:
@@ -495,7 +609,7 @@ export function registerTools(
       }),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_export_job",
     {
       description:
@@ -524,21 +638,44 @@ export function registerTools(
         const raw = await client.downloadExportData(workspace_id, job_id);
         guardExportSize(raw.length);
         const { rows, raw: rawJson } = parseExportRows(raw);
+        const saveSpill = async (body: string, ct: string) => {
+          if (!opts.exportStore) return undefined;
+          try {
+            return await opts.exportStore.save(body, ct);
+          } catch {
+            return undefined;
+          }
+        };
         if (rows.length === 0 && rawJson === undefined) {
           // Parsed JSON with genuinely zero rows.
           return { ...status, row_count: 0, rows: [] };
         }
         if (rows.length === 0) {
-          // CSV (or unrecognized) — return raw text, capped.
+          // CSV (or unrecognized) — return raw text, capped; spill the full body when capped.
           const text = rawJson ?? raw;
-          return { ...status, data: text.slice(0, 100_000), truncated_chars: text.length > 100_000 };
+          const capped = text.length > 100_000;
+          const spill = capped ? await saveSpill(text, "text/csv") : undefined;
+          return {
+            ...status,
+            data: text.slice(0, 100_000),
+            truncated_chars: capped,
+            ...(spill ? { full_result_url: spill.url, full_result_expires_at: spill.expires_at } : {}),
+          };
         }
         const { rows: out, truncated, total } = capRows(rows, max_rows ?? 1000);
-        return { ...status, row_count: total, returned: out.length, truncated, rows: out };
+        const spill = truncated ? await saveSpill(raw, "application/json") : undefined;
+        return {
+          ...status,
+          row_count: total,
+          returned: out.length,
+          truncated,
+          ...(spill ? { full_result_url: spill.url, full_result_expires_at: spill.expires_at } : {}),
+          rows: out,
+        };
       }),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_import_job",
     {
       description:
@@ -835,7 +972,7 @@ export function registerTools(
 
   // ============================ Discovery (reads) ============================
 
-  server.registerTool(
+  readTool(
     "zoho_list_folders",
     {
       description: "List the folders in a workspace (folders group views).",
@@ -845,7 +982,7 @@ export function registerTools(
     async ({ workspace_id }) => run(() => client.getFolders(workspace_id)),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_list_dashboards",
     {
       description: "List dashboards across the org. scope: all (default), owned, or shared.",
@@ -858,7 +995,7 @@ export function registerTools(
       ),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_list_recent_views",
     {
       description: "List recently accessed views.",
@@ -868,7 +1005,7 @@ export function registerTools(
     async () => run(() => client.getRecentViews()),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_view_metadata",
     {
       description:
@@ -879,7 +1016,7 @@ export function registerTools(
     async ({ workspace_id, view_id }) => run(() => client.getViewMetadata(workspace_id, view_id)),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_trash",
     {
       description:
@@ -890,7 +1027,7 @@ export function registerTools(
     async ({ workspace_id }) => run(() => client.getTrashViews(workspace_id)),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_list_datasources",
     {
       description: "List a workspace's data sources (sync status, schedule, the tables each feeds).",
@@ -928,7 +1065,7 @@ export function registerTools(
     },
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_query_table",
     {
       description: "Get a query table's details, including its CURRENT SQL — read this before zoho_edit_query_table, which overwrites the SQL completely.",
@@ -1468,7 +1605,7 @@ export function registerTools(
     },
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_workspace_secret_key",
     {
       description:
@@ -1525,7 +1662,7 @@ export function registerTools(
 
   // ============================ Sharing ============================
 
-  server.registerTool(
+  readTool(
     "zoho_get_shared_details",
     {
       description:
@@ -1541,7 +1678,7 @@ export function registerTools(
     },
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_my_permissions",
     {
       description: "Get the current user's permissions on a specific view.",
@@ -1651,7 +1788,7 @@ export function registerTools(
     },
   );
 
-  server.registerTool(
+  readTool(
     "zoho_list_groups",
     {
       description: "List the sharing groups in a workspace.",
@@ -1731,7 +1868,7 @@ export function registerTools(
     async ({ workspace_id, group_id, email_ids }) => run(() => client.removeGroupMembers(workspace_id, group_id, { emailIds: email_ids })),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_workspace_admins",
     {
       description: "List the admins of a workspace.",
@@ -1767,7 +1904,7 @@ export function registerTools(
     },
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_org_admins",
     {
       description: "List the organization admins.",
@@ -1779,7 +1916,7 @@ export function registerTools(
 
   // ============================ User management ============================
 
-  server.registerTool(
+  readTool(
     "zoho_list_users",
     {
       description: "List the users in the organization (email, status, role).",
@@ -1789,7 +1926,7 @@ export function registerTools(
     async () => run(() => client.getUsers()),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_subscription",
     {
       description: "Get the org's subscription/plan details.",
@@ -1799,7 +1936,7 @@ export function registerTools(
     async () => run(() => client.getSubscription()),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_resources",
     {
       description: "Get the org's resource usage (allocated / used / remaining).",
@@ -1809,7 +1946,7 @@ export function registerTools(
     async () => run(() => client.getResources()),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_list_workspace_users",
     {
       description: "List the users of a specific workspace (email, status, role).",
@@ -1919,7 +2056,7 @@ export function registerTools(
 
   // ============================ Embed / publish ============================
 
-  server.registerTool(
+  readTool(
     "zoho_get_view_url",
     {
       description: "Get a shareable open-view URL for a view. Use options for title/toolbar/legend display flags.",
@@ -1929,7 +2066,7 @@ export function registerTools(
     async ({ workspace_id, view_id, options }) => run(() => client.getViewUrl(workspace_id, view_id, options)),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_embed_url",
     {
       description: "Get an embed URL for a view (embedded-analytics). Use options for validityPeriod/permissions/criteria.",
@@ -1939,7 +2076,7 @@ export function registerTools(
     async ({ workspace_id, view_id, options }) => run(() => client.getEmbedUrl(workspace_id, view_id, options)),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_private_url",
     {
       description:
@@ -1996,7 +2133,7 @@ export function registerTools(
     async ({ workspace_id, view_id }) => run(() => client.removePublic(workspace_id, view_id)),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_publish_config",
     {
       description: "Get a view's publish configuration (public/private/embed settings).",
@@ -2016,7 +2153,7 @@ export function registerTools(
     async ({ workspace_id, view_id, options }) => run(() => client.updatePublishConfig(workspace_id, view_id, options)),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_list_slideshows",
     {
       description: "List the slideshows in a workspace.",
@@ -2042,7 +2179,7 @@ export function registerTools(
       run(() => client.createSlideshow(workspace_id, { slideName: slide_name, viewIds: view_ids, ...(access_type != null ? { accessType: access_type } : {}) })),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_slideshow",
     {
       description: "Get a slideshow's details (name, access type, the view ids it contains) — read before zoho_update_slideshow, which replaces fields blind.",
@@ -2093,7 +2230,7 @@ export function registerTools(
     async ({ workspace_id, slide_id }) => run(() => client.deleteSlideshow(workspace_id, slide_id)),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_slideshow_url",
     {
       description: "Get the shareable URL for a slideshow. Use options for autoplay/slideInterval/title flags.",
@@ -2105,7 +2242,7 @@ export function registerTools(
 
   // ============================ Variables ============================
 
-  server.registerTool(
+  readTool(
     "zoho_list_variables",
     {
       description: "List the variables defined in a workspace.",
@@ -2138,7 +2275,7 @@ export function registerTools(
       ),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_variable",
     {
       description: "Get a variable's full definition (type, data type, default/user-specific values) — read before zoho_update_variable.",
@@ -2170,7 +2307,7 @@ export function registerTools(
 
   // ============================ Dependents, formulas & import details (reads) ============================
 
-  server.registerTool(
+  readTool(
     "zoho_get_dependents",
     {
       description: "List the views that depend on a view — or, when column_id is given, on a specific column. Check before deleting either.",
@@ -2181,7 +2318,7 @@ export function registerTools(
       run(() => (column_id ? client.getColumnDependents(workspace_id, view_id, column_id) : client.getViewDependents(workspace_id, view_id))),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_list_formula_columns",
     {
       description: "List the custom (inline) formula columns of a table.",
@@ -2191,7 +2328,7 @@ export function registerTools(
     async ({ workspace_id, view_id }) => run(() => client.getCustomFormulas(workspace_id, view_id)),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_list_aggregate_formulas",
     {
       description: "List aggregate formulas — of one table when view_id is given, else across the whole workspace.",
@@ -2202,7 +2339,7 @@ export function registerTools(
       run(() => (view_id ? client.getViewAggregateFormulas(workspace_id, view_id) : client.getWorkspaceAggregateFormulas(workspace_id))),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_aggregate_formula_value",
     {
       description: "Evaluate an aggregate formula and return its current value.",
@@ -2212,7 +2349,7 @@ export function registerTools(
     async ({ workspace_id, formula_id }) => run(() => client.getAggregateFormulaValue(workspace_id, formula_id)),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_aggregate_formula_dependents",
     {
       description: "List the views that depend on an aggregate formula.",
@@ -2222,7 +2359,7 @@ export function registerTools(
     async ({ workspace_id, formula_id }) => run(() => client.getAggregateFormulaDependents(workspace_id, formula_id)),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_last_import_details",
     {
       description: "Get the details of the most recent data import into a table.",
@@ -2232,7 +2369,7 @@ export function registerTools(
     async ({ workspace_id, view_id }) => run(() => client.getLastImportDetails(workspace_id, view_id)),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_export_workspace_template",
     {
       description:
@@ -2479,7 +2616,7 @@ export function registerTools(
 
   // ============================ Email schedules ============================
 
-  server.registerTool(
+  readTool(
     "zoho_list_email_schedules",
     {
       description: "List the scheduled email exports configured in a workspace.",
@@ -2593,7 +2730,7 @@ export function registerTools(
 
   // ============================ AutoML ============================
 
-  server.registerTool(
+  readTool(
     "zoho_list_automl_analysis",
     {
       description: "List AutoML analyses — across the org, or within one workspace when workspace_id is given.",
@@ -2604,7 +2741,7 @@ export function registerTools(
       run(() => (workspace_id ? client.getAutoMLAnalysisInWorkspace(workspace_id) : client.getAutoMLAnalysisOrg())),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_get_automl_analysis",
     {
       description: "Get the details of an AutoML analysis (models, status, metrics).",
@@ -2614,7 +2751,7 @@ export function registerTools(
     async ({ workspace_id, analysis_id }) => run(() => client.getAutoMLAnalysisDetails(workspace_id, analysis_id)),
   );
 
-  server.registerTool(
+  readTool(
     "zoho_list_automl_deployments",
     {
       description: "List the deployments of an AutoML model.",
@@ -2759,7 +2896,7 @@ export function registerTools(
     },
   );
 
-  server.registerTool(
+  readTool(
     "zoho_automl_whatif",
     {
       description: "What-if analysis: feed a model one set of feature values and get its prediction. features = { columnName: value, ... }.",
@@ -2773,5 +2910,87 @@ export function registerTools(
     },
     async ({ workspace_id, analysis_id, model_id, features }) =>
       run(() => client.autoMLWhatIf(workspace_id, analysis_id, model_id, { features })),
+  );
+}
+
+/**
+ * MCP resources + prompts (shared by both workers).
+ *
+ * Resources let a consumer browse context without burning tool calls; prompts
+ * encode the proven everyday workflows so a smaller model (the intended daily
+ * consumer is Sonnet-class) starts from a good plan instead of rediscovering one.
+ */
+export function registerResourcesAndPrompts(server: McpServer, client: ZohoAnalyticsClient): void {
+  server.registerResource(
+    "workspaces",
+    "zoho://workspaces",
+    {
+      title: "Zoho Analytics workspaces",
+      description: "All workspaces (owned + shared) visible to this connector, as compact JSON.",
+      mimeType: "application/json",
+    },
+    async (uri) => {
+      const res = (await client.getWorkspaces()) as AnyRec;
+      const data = res?.data ?? res;
+      const trim = (ws: AnyRec[] | undefined) =>
+        (ws ?? []).map((w) => ({ workspaceId: w.workspaceId, workspaceName: w.workspaceName }));
+      const body = { ownedWorkspaces: trim(data?.ownedWorkspaces), sharedWorkspaces: trim(data?.sharedWorkspaces) };
+      return { contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(body, null, 2) }] };
+    },
+  );
+
+  server.registerPrompt(
+    "profile-workspace",
+    {
+      title: "Profile a workspace",
+      description: "Map a workspace's tables and columns, then sample its key data.",
+      argsSchema: { workspace: z.string().optional().describe("Workspace name or id (omit to pick interactively).") },
+    },
+    ({ workspace }) => ({
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text:
+              `Profile my Zoho Analytics workspace${workspace ? ` "${workspace}"` : ""}. ` +
+              `Steps: (1) zoho_list_workspaces to resolve the workspace id${workspace ? "" : " and ask me which one"}; ` +
+              `(2) zoho_describe_workspace for the schema map (tables + columns); ` +
+              `(3) for the 2-3 most important tables, run zoho_query_data with COUNT(*) and a 5-row sample ` +
+              `(remember: quote identifiers, alias aggregates and order by the alias); ` +
+              `(4) summarize what this workspace tracks, table by table, with row counts.`,
+          },
+        },
+      ],
+    }),
+  );
+
+  server.registerPrompt(
+    "analytics-question",
+    {
+      title: "Answer a data question with SQL",
+      description: "Translate a business question into Zoho SQL and answer it with real data.",
+      argsSchema: {
+        question: z.string().describe("The business question, e.g. 'top 5 users by activity this month'."),
+        workspace: z.string().optional().describe("Workspace name or id, if known."),
+      },
+    },
+    ({ question, workspace }) => ({
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text:
+              `Answer this question from my Zoho Analytics data: "${question}". ` +
+              `${workspace ? `Use workspace "${workspace}". ` : "First resolve the right workspace via zoho_list_workspaces. "}` +
+              `Find the relevant table with zoho_describe_workspace, then answer with zoho_query_data. ` +
+              `Zoho SQL rules: double-quote all identifiers; never put aggregates in ORDER BY/GROUP BY/WHERE — ` +
+              `alias them in SELECT and reference the alias; non-aggregated SELECT columns must appear in GROUP BY. ` +
+              `Show the SQL you ran and present the result as a small table with a one-line takeaway.`,
+          },
+        },
+      ],
+    }),
   );
 }

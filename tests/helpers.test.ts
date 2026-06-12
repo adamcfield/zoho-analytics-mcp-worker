@@ -9,6 +9,11 @@ describe("readableViewType", () => {
     expect(readableViewType(99)).toBe("type 99");
     expect(readableViewType(undefined)).toBe("type unknown");
   });
+  it("accepts the name strings Zoho returns live (not just numeric codes)", () => {
+    expect(readableViewType("AnalysisView")).toBe("AnalysisView");
+    expect(readableViewType("Query Table")).toBe("Query Table");
+    expect(readableViewType("Dashboard")).toBe("Dashboard");
+  });
 });
 
 describe("compactView", () => {

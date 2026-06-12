@@ -240,6 +240,11 @@ Set via `npx wrangler secret put <NAME>` (secrets) or a `[vars]` block (non-secr
 | `ZOHO_ACCOUNTS_BASE_URL` | both | optional | Override the accounts/OAuth host |
 | `ZOHO_MAX_RETRIES` | both | optional | Max retries for idempotent calls (default `3`) |
 | `MCP_READONLY` | both | optional | `true` ⇒ register read tools only |
+| `MCP_CORE` | both | optional | `true` ⇒ register only the curated ~26 everyday tools (best tool-selection accuracy for daily LLM use) |
+| `EXPORTS` (binding) + `PUBLIC_BASE_URL` | bearer | optional | R2 spill: truncated exports persist fully and return 24h signed `/download/` URLs (enable R2 once in the dashboard, then uncomment in wrangler.jsonc) |
+| `USAGE` (binding) | bearer | optional | Workers Analytics Engine per-tool usage telemetry |
+| `RATE_LIMITER` (binding) | bearer | optional | Per-IP flood cap (300 req/min) |
+| `ZOHO_MULTI_USER` | oauth | optional | `true` ⇒ per-user Zoho login on consent instead of the shared passphrase; each user's refresh token lives in encrypted grant props (needs a server-based Zoho client with redirect `<origin>/zoho/callback`) |
 
 ---
 

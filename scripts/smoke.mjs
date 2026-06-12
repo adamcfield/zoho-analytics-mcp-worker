@@ -87,13 +87,22 @@ await rpc({ jsonrpc: "2.0", method: "notifications/initialized" });
 
 const list = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" });
 const tools = list.body?.result?.tools ?? [];
-// Detect a read-only (MCP_READONLY=true) deployment by the absence of write tools.
-const readonly = !WRITE_TOOLS.some((t) => tools.some((x) => x.name === t));
+const has = (t) => tools.some((x) => x.name === t);
+// Detect deployment mode: MCP_READONLY (no write tools) or MCP_CORE (~26 curated tools).
+const readonly = !WRITE_TOOLS.some(has);
+const core = !readonly && tools.length < 60;
 if (readonly) console.log("note: read-only deployment detected — skipping write-tool checks");
-// Full deploy registers ~144 tools; MCP_READONLY trims to ~51 reads.
-check("tools/list", tools.length >= (readonly ? 40 : 130), `(${tools.length} tools)`);
-for (const t of READ_TOOLS) check(`tool present: ${t}`, tools.some((x) => x.name === t));
-if (!readonly) for (const t of WRITE_TOOLS) check(`tool present: ${t}`, tools.some((x) => x.name === t));
+if (core) console.log("note: MCP_CORE deployment detected (~26 curated tools)");
+// Full deploy registers ~144 tools; MCP_READONLY trims to ~51 reads; MCP_CORE to ~26.
+check("tools/list", tools.length >= (readonly ? 40 : core ? 20 : 130), `(${tools.length} tools)`);
+const CORE_SUBSET = ["zoho_whoami", "zoho_list_workspaces", "zoho_describe_workspace", "zoho_query_data", "zoho_add_row", "zoho_import_data"];
+for (const t of core ? CORE_SUBSET : READ_TOOLS) check(`tool present: ${t}`, has(t));
+if (!readonly && !core) for (const t of WRITE_TOOLS) check(`tool present: ${t}`, has(t));
+
+const resources = await rpc({ jsonrpc: "2.0", id: 4, method: "resources/list" });
+check("resources/list (zoho://workspaces)", (resources.body?.result?.resources ?? []).some((r) => r.uri === "zoho://workspaces"));
+const prompts = await rpc({ jsonrpc: "2.0", id: 5, method: "prompts/list" });
+check("prompts/list (>= 2 prompts)", (prompts.body?.result?.prompts ?? []).length >= 2);
 
 const who = await rpc({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "zoho_whoami", arguments: {} } });
 let whoOk = false;

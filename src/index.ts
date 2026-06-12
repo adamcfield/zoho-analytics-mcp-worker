@@ -27,8 +27,13 @@
 
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ZohoAnalyticsClient, kvTokenStore } from "./zohoanalytics.js";
-import { registerTools } from "./tools.js";
+import { ZohoAnalyticsClient, kvTokenStore, signDownloadToken, verifyDownloadToken } from "./zohoanalytics.js";
+import { registerTools, registerResourcesAndPrompts, type RegisterToolsOptions } from "./tools.js";
+
+/** Workers Rate Limiting binding (open beta) — structural type. */
+interface RateLimit {
+  limit(options: { key: string }): Promise<{ success: boolean }>;
+}
 
 declare global {
   namespace Cloudflare {
@@ -52,9 +57,20 @@ declare global {
        * Durable Object, and without a shared cache every new session mints its
        * own token — Zoho caps token creation at ~10 per 10 min per refresh
        * token. Create with `wrangler kv namespace create TOKEN_KV` and add a
-       * kv_namespaces entry to wrangler.jsonc.
+       * kv_namespaces entry to wrangler.jsonc. Also backs the short-TTL schema
+       * cache (describe-workspace).
        */
       TOKEN_KV?: KVNamespace;
+      /** "true" => register only the curated ~26 everyday tools (better tool selection for daily LLM use). */
+      MCP_CORE?: string;
+      /** Optional R2 bucket: oversized export results spill here and come back as signed URLs. */
+      EXPORTS?: R2Bucket;
+      /** Public origin of this worker (for building signed /download URLs). */
+      PUBLIC_BASE_URL?: string;
+      /** Optional Workers Analytics Engine dataset: per-tool usage telemetry. */
+      USAGE?: AnalyticsEngineDataset;
+      /** Optional Workers rate-limiter: per-IP request flood cap (auth brute force is already infeasible). */
+      RATE_LIMITER?: unknown;
     }
   }
 }
@@ -76,15 +92,51 @@ export function clientFromEnv(env: Env): ZohoAnalyticsClient {
   });
 }
 
+/** Optional integrations resolved from the environment (all degrade to undefined). */
+export function integrationsFromEnv(env: Env): Pick<RegisterToolsOptions, "track" | "cache" | "exportStore"> {
+  const track = env.USAGE
+    ? (tool: string, ok: boolean) => {
+        env.USAGE!.writeDataPoint({ blobs: [tool, ok ? "ok" : "error"], doubles: [1], indexes: [tool] });
+      }
+    : undefined;
+  const cache = env.TOKEN_KV
+    ? {
+        get: (key: string) => env.TOKEN_KV!.get(key),
+        put: (key: string, value: string, ttlSecs: number) =>
+          env.TOKEN_KV!.put(key, value, { expirationTtl: Math.max(60, ttlSecs) }),
+      }
+    : undefined;
+  const exportStore =
+    env.EXPORTS && env.PUBLIC_BASE_URL && env.MCP_AUTH_TOKEN
+      ? {
+          save: async (body: string, contentType: string) => {
+            const key = `exp/${crypto.randomUUID()}`;
+            await env.EXPORTS!.put(key, body, { httpMetadata: { contentType } });
+            const exp = Math.floor(Date.now() / 1000) + 24 * 3600;
+            const sig = await signDownloadToken(key, exp, env.MCP_AUTH_TOKEN);
+            return {
+              url: `${env.PUBLIC_BASE_URL!.replace(/\/+$/, "")}/download/${key}?exp=${exp}&sig=${sig}`,
+              expires_at: new Date(exp * 1000).toISOString(),
+            };
+          },
+        }
+      : undefined;
+  return { track, cache, exportStore };
+}
+
 export class ZohoAnalyticsMCP extends McpAgent<Env> {
-  server = new McpServer({ name: "zoho-analytics", version: "1.5.3" });
+  server = new McpServer({ name: "zoho-analytics", version: "1.6.0" });
 
   async init(): Promise<void> {
-    registerTools(this.server, clientFromEnv(this.env), {
+    const client = clientFromEnv(this.env);
+    registerTools(this.server, client, {
       orgId: this.env.ZOHO_ORG_ID,
       dc: this.env.ZOHO_DC ?? "com",
       readOnly: this.env.MCP_READONLY === "true",
+      core: this.env.MCP_CORE === "true",
+      ...integrationsFromEnv(this.env),
     });
+    registerResourcesAndPrompts(this.server, client);
   }
 }
 
@@ -112,11 +164,41 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
+    // Per-IP flood cap (when the rate-limiter binding is configured). The bearer
+    // token is brute-force-infeasible; this bounds request-volume cost instead.
+    const limiter = env.RATE_LIMITER as RateLimit | undefined;
+    if (limiter && typeof limiter.limit === "function") {
+      try {
+        const { success } = await limiter.limit({ key: request.headers.get("cf-connecting-ip") ?? "unknown" });
+        if (!success) {
+          return new Response("Rate limited. Slow down.", { status: 429, headers: { "retry-after": "60" } });
+        }
+      } catch {
+        /* a limiter outage must not take the API down */
+      }
+    }
+
     // Public, unauthenticated health check.
     if (request.method === "GET" && url.pathname === "/") {
       return new Response("zoho-analytics-mcp worker: ok", {
         status: 200,
         headers: { "content-type": "text/plain" },
+      });
+    }
+
+    // Signed export downloads (capability URL — the HMAC in the query IS the auth).
+    if (request.method === "GET" && url.pathname.startsWith("/download/") && env.EXPORTS && env.MCP_AUTH_TOKEN) {
+      const key = decodeURIComponent(url.pathname.slice("/download/".length));
+      const exp = Number(url.searchParams.get("exp"));
+      const sig = url.searchParams.get("sig") ?? "";
+      if (!key.startsWith("exp/") || !(await verifyDownloadToken(key, exp, sig, env.MCP_AUTH_TOKEN))) {
+        return new Response("Invalid or expired download link", { status: 403 });
+      }
+      const obj = await env.EXPORTS.get(key);
+      if (!obj) return new Response("Export not found (expired)", { status: 404 });
+      return new Response(obj.body, {
+        status: 200,
+        headers: { "content-type": obj.httpMetadata?.contentType ?? "application/octet-stream" },
       });
     }
 
