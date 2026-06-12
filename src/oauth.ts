@@ -43,7 +43,7 @@ type AuthRequest = Awaited<ReturnType<OAuthHelpers["parseAuthRequest"]>>;
 
 /** The MCP agent — identical tool surface to the bearer worker. */
 export class ZohoAnalyticsMCP extends McpAgent<Env, unknown, Props> {
-  server = new McpServer({ name: "zoho-analytics", version: "1.4.0" });
+  server = new McpServer({ name: "zoho-analytics", version: "1.5.0" });
 
   async init(): Promise<void> {
     const client = new ZohoAnalyticsClient({
@@ -78,7 +78,15 @@ function safeEqual(a: string, b: string): boolean {
 
 /** UTF-8-safe base64 round-trip (btoa alone throws on code points > 0xFF, e.g. a unicode OAuth `state`). */
 function b64encodeUtf8(s: string): string {
-  return btoa(String.fromCharCode(...new TextEncoder().encode(s)));
+  // Chunked: spreading a large byte array into fromCharCode overflows the
+  // argument/stack limit (~125KB) — an attacker-sized `state` must not 500.
+  const bytes = new TextEncoder().encode(s);
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
 }
 function b64decodeUtf8(b64: string): string {
   return new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)));

@@ -470,12 +470,53 @@ describe("sweep round 1 regressions", () => {
     expect(f).toHaveBeenCalledTimes(1); // plain reads still retry; regeneration must not
   });
 
-  it("refuses an oversized export via the declared Content-Length before reading the body", async () => {
+  it("refuses an oversized export via the declared Content-Length BEFORE reading the body", async () => {
+    let bodyRead = false;
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (..._args: FetchArgs) => new Response("x", { status: 200, headers: { "content-length": "999999999" } })),
+      vi.fn(async (..._args: FetchArgs) => {
+        const res = new Response("x", { status: 200, headers: { "content-length": "999999999" } });
+        // Instrument the read methods: the size guard must reject without calling either.
+        res.text = async () => {
+          bodyRead = true;
+          return "x";
+        };
+        res.arrayBuffer = async () => {
+          bodyRead = true;
+          return new ArrayBuffer(1);
+        };
+        return res;
+      }),
     );
     await expect(mkStatic().exportData("W", "V", { responseFormat: "csv" })).rejects.toThrow(/exceeds the 10MB limit/);
+    expect(bodyRead).toBe(false); // the guard must fire before any body bytes are consumed
+  });
+
+  it("export-job creation (a state-creating GET) is never auto-retried", async () => {
+    const f = mockSequence([{ status: 500, body: "boom" }]);
+    vi.stubGlobal("fetch", f);
+    await expect(mkStatic().createExportJobBySql("W", "select 1", "csv")).rejects.toMatchObject({ status: 500 });
+    expect(f).toHaveBeenCalledTimes(1);
+  });
+
+  it("share/remove are workspace-scoped; update-share is per-view (live-docs paths)", async () => {
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", f);
+    const c = mkStatic();
+    await c.shareViews("W", { emailIds: ["a@x.com"], viewIds: ["v"], permissions: { read: true } });
+    await c.removeShare("W", { emailIds: ["a@x.com"], removeAllViews: true });
+    await c.updateSharedViews("W", "V1", { permissions: { read: true } });
+    const urls = f.mock.calls.map((call) => String(call[0]));
+    expect(urls[0]).toMatch(/\/workspaces\/W\/share$/);
+    expect(urls[1]).toMatch(/\/workspaces\/W\/share$/);
+    expect(urls[2]).toContain("/workspaces/W/views/V1/share");
+  });
+
+  it("getDatasources is workspace-scoped (live-docs path)", async () => {
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 }));
+    vi.stubGlobal("fetch", f);
+    await mkStatic().getDatasources("W");
+    expect(String(f.mock.calls[0][0])).toMatch(/\/workspaces\/W\/datasources$/);
   });
 });
 

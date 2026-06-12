@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.5.0 — Sweep round 2 (18 confirmed findings fixed)
+
+Second sweep round: 18 confirmed (vs 29 in round 1 — converging), all fixed.
+
+### Live-docs path corrections (OAS disagreed again)
+- **Sharing:** share/remove-share are `POST|DELETE /workspaces/{id}/share` (not `/views/share`);
+  the update is per-view `PUT /workspaces/{id}/views/{view-id}/share` — `zoho_update_shared_views`
+  now takes a required `view_id`.
+- **Datasources:** `GET /workspaces/{id}/datasources` is workspace-scoped — `zoho_list_datasources`
+  no longer takes a view_id.
+
+### Token-flow concurrency (introduced by the round-1 self-heal)
+- The refresh now returns a `{token, expiry}` snapshot so a concurrent 401 can't poison the KV
+  entry with `expiry: 0`; a late 401 only clears the cache if it still holds the rejected token;
+  and an acquire that re-adopted the just-rejected token runs one more mint.
+
+### Reliability / safety
+- Export-job creation (a state-creating GET) is never auto-retried (could create duplicate jobs);
+  `exportAsTemplate` got the Content-Length precheck; `adv()` flipped to options-FIRST everywhere
+  (passthroughs can no longer override audited/validated keys on share/email-schedule/table-from-
+  data); `zoho_remove_share` rejects view_ids + remove_all_views together; cascade flags now echo
+  in dry_run/audit on delete_column/delete_folder/delete_trash_view; `zoho_sort_data` reset no
+  longer demands fake columns; `zoho_get_shared_details` rejects an explicit empty view_ids;
+  consent-page base64 encode is chunked (oversized unicode `state` no longer 500s);
+  `zoho_list_workspaces` scope=owned/shared now parses the correct response shape (was returning
+  empty lists).
+- Export tools gained the `options` passthrough (delimiter, showHiddenCols, ...). The
+  Content-Length test now proves the body is never read; **59 tests**.
+
 ## 1.4.0 — Sweep round 1 (29 confirmed findings fixed)
 
 First round of the repetitive full-coverage sweep (7 inspectors over every file, each finding

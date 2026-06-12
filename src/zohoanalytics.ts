@@ -270,7 +270,17 @@ export class ZohoAnalyticsClient {
     this.refreshPromise ??= this.acquireAccessToken().finally(() => {
       this.refreshPromise = undefined;
     });
-    return this.refreshPromise;
+    let token = await this.refreshPromise;
+    // A concurrent 401 may have rejected exactly this token while the flight was
+    // in progress (the flight can adopt a dead token from the store before the
+    // rejection is recorded). Run one more acquire in that case.
+    if (this.lastRejectedToken && token === this.lastRejectedToken) {
+      this.refreshPromise ??= this.acquireAccessToken().finally(() => {
+        this.refreshPromise = undefined;
+      });
+      token = await this.refreshPromise;
+    }
+    return token;
   }
 
   /** Check the shared cross-instance store first; only mint a new token on a miss. */
@@ -287,22 +297,25 @@ export class ZohoAnalyticsClient {
         return stored.token;
       }
     }
-    const token = await this.refreshAccessToken();
+    // Use the returned snapshot, not the instance fields — a concurrent 401
+    // handler could zero this.accessTokenExpiry between the mint resolving and
+    // this continuation running, which would persist a dead {token, expiry: 0}.
+    const minted = await this.refreshAccessToken();
     this.lastRejectedToken = undefined;
     if (this.tokenStore) {
       // Best-effort: overwrites a poisoned entry so other sessions heal too. A
       // throwing store must not fail the request — the token itself is valid.
       try {
-        await this.tokenStore.set(token, this.accessTokenExpiry);
+        await this.tokenStore.set(minted.token, minted.expiry);
       } catch {
         /* best-effort */
       }
     }
-    return token;
+    return minted.token;
   }
 
   /** Exchange the refresh token for a fresh access token at the accounts endpoint. */
-  private async refreshAccessToken(): Promise<string> {
+  private async refreshAccessToken(): Promise<{ token: string; expiry: number }> {
     if (!this.refreshToken || !this.clientId || !this.clientSecret) {
       throw new Error("Cannot refresh: missing refreshToken/clientId/clientSecret.");
     }
@@ -335,10 +348,11 @@ export class ZohoAnalyticsClient {
           /* non-JSON body handled below */
         }
         if (res.ok && typeof data.access_token === "string") {
-          this.accessToken = data.access_token;
           const expiresIn = typeof data.expires_in === "number" ? data.expires_in : 3600;
-          this.accessTokenExpiry = Date.now() + expiresIn * 1000;
-          return this.accessToken;
+          const expiry = Date.now() + expiresIn * 1000;
+          this.accessToken = data.access_token;
+          this.accessTokenExpiry = expiry;
+          return { token: data.access_token, expiry };
         }
         // Zoho reports OAuth failures as { error: "invalid_code" } with HTTP 200.
         const errCode = typeof data.error === "string" ? data.error : `HTTP ${res.status}`;
@@ -463,8 +477,12 @@ export class ZohoAnalyticsClient {
         if (res.status === 401 && !refreshed && !this.staticAccessToken) {
           refreshed = true;
           this.lastRejectedToken = token;
-          this.accessToken = undefined;
-          this.accessTokenExpiry = 0;
+          // Only clear the cache if it still holds the rejected token — a late
+          // 401 must not clobber a token that a concurrent heal already minted.
+          if (this.accessToken === token) {
+            this.accessToken = undefined;
+            this.accessTokenExpiry = 0;
+          }
           continue;
         }
 
@@ -591,8 +609,9 @@ export class ZohoAnalyticsClient {
   getTrashViews(workspaceId: string) {
     return this.request("GET", `/workspaces/${enc(workspaceId)}/trash`);
   }
-  getDatasources(workspaceId: string, viewId: string) {
-    return this.request("GET", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/datasources`);
+  /** Workspace-scoped per Zoho's live docs + SDK (their OAS nests it under /views/{id}). */
+  getDatasources(workspaceId: string) {
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/datasources`);
   }
 
   // ============================ Data API (synchronous) ============================
@@ -627,15 +646,16 @@ export class ZohoAnalyticsClient {
 
   // ============================ Bulk API (asynchronous) ============================
 
-  /** Create an export job from a SQL query. Returns envelope with data.jobId. */
-  createExportJobBySql(workspaceId: string, sqlQuery: string, responseFormat: ResponseFormat = "json") {
+  /** Create an export job from a SQL query. Returns envelope with data.jobId. (State-creating GET — never auto-retried.) */
+  createExportJobBySql(workspaceId: string, sqlQuery: string, responseFormat: ResponseFormat = "json", extra?: Config) {
     return this.request("GET", `/bulk/workspaces/${enc(workspaceId)}/data`, {
-      config: { responseFormat, sqlQuery },
+      config: { ...(extra ?? {}), responseFormat, sqlQuery },
+      neverRetry: true,
     });
   }
-  /** Create an export job for an entire view. config: { responseFormat (required), criteria?, ... }. */
+  /** Create an export job for an entire view. config: { responseFormat (required), criteria?, ... }. (State-creating GET — never auto-retried.) */
   createExportJobByView(workspaceId: string, viewId: string, config: Config) {
-    return this.request("GET", `/bulk/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/data`, { config });
+    return this.request("GET", `/bulk/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/data`, { config, neverRetry: true });
   }
   /** Poll an export job. Returns envelope with data.jobCode/jobStatus/downloadUrl. */
   getExportJobStatus(workspaceId: string, jobId: string) {
@@ -824,16 +844,19 @@ export class ZohoAnalyticsClient {
 
   // ============================ Sharing API ============================
 
+  // Share/remove are workspace-scoped and update is per-view, per Zoho's live
+  // docs + SDK (their OAS nests all three under /views/share — the docs win).
   /** config: { emailIds, viewIds, permissions:{read,...}, groupIds?, criteria?, inviteMail?, ... }. */
   shareViews(workspaceId: string, config: Config) {
-    return this.request("POST", `/workspaces/${enc(workspaceId)}/views/share`, { config });
+    return this.request("POST", `/workspaces/${enc(workspaceId)}/share`, { config });
   }
-  updateSharedViews(workspaceId: string, config: Config) {
-    return this.request("PUT", `/workspaces/${enc(workspaceId)}/views/share`, { config });
+  /** Update one view's share permissions. config: { emailIds?/groupIds?, permissions, ... }. */
+  updateSharedViews(workspaceId: string, viewId: string, config: Config) {
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/share`, { config });
   }
   /** config: { emailIds, viewIds?, removeAllViews?, groupIds? }. */
   removeShare(workspaceId: string, config: Config) {
-    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/views/share`, { config });
+    return this.request("DELETE", `/workspaces/${enc(workspaceId)}/share`, { config });
   }
   getSharedDetails(workspaceId: string, viewIds: string[]) {
     return this.request("GET", `/workspaces/${enc(workspaceId)}/share/shareddetails`, { config: { viewIds } });
@@ -1066,7 +1089,11 @@ export class ZohoAnalyticsClient {
   }
   /** Export selected views as a reusable template ZIP, returned base64-encoded. */
   exportAsTemplate(workspaceId: string, viewIds: string[]): Promise<string> {
-    return this.requestRaw("GET", `/workspaces/${enc(workspaceId)}/template/data`, { config: { viewIds }, binary: true });
+    return this.requestRaw("GET", `/workspaces/${enc(workspaceId)}/template/data`, {
+      config: { viewIds },
+      binary: true,
+      maxBodyBytes: 1_000_000, // the tool refuses >~256KB anyway; don't buffer megabytes first
+    });
   }
 
   // ============================ Metadata: favorites / default / domain access ============================
