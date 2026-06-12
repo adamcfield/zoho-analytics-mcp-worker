@@ -77,7 +77,7 @@ export function clientFromEnv(env: Env): ZohoAnalyticsClient {
 }
 
 export class ZohoAnalyticsMCP extends McpAgent<Env> {
-  server = new McpServer({ name: "zoho-analytics", version: "1.5.2" });
+  server = new McpServer({ name: "zoho-analytics", version: "1.5.3" });
 
   async init(): Promise<void> {
     registerTools(this.server, clientFromEnv(this.env), {
@@ -125,6 +125,18 @@ export default {
         status: 401,
         headers: { "www-authenticate": "Bearer" },
       });
+    }
+
+    // Deployed-but-unconfigured guard: without Zoho credentials the client
+    // constructor would throw inside the Durable Object (an opaque 1101).
+    // Surface the actual problem to the (already-authenticated) caller instead.
+    const hasZohoCreds =
+      !!env.ZOHO_ACCESS_TOKEN || !!(env.ZOHO_REFRESH_TOKEN && env.ZOHO_CLIENT_ID && env.ZOHO_CLIENT_SECRET);
+    if (!hasZohoCreds) {
+      return new Response(
+        "Zoho credentials not configured. Set the ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET and ZOHO_REFRESH_TOKEN secrets (wrangler secret put ...) — see the README's deploy section.",
+        { status: 503 },
+      );
     }
 
     if (url.pathname === "/mcp") {

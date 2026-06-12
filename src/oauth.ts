@@ -43,7 +43,7 @@ type AuthRequest = Awaited<ReturnType<OAuthHelpers["parseAuthRequest"]>>;
 
 /** The MCP agent — identical tool surface to the bearer worker. */
 export class ZohoAnalyticsMCP extends McpAgent<Env, unknown, Props> {
-  server = new McpServer({ name: "zoho-analytics", version: "1.5.2" });
+  server = new McpServer({ name: "zoho-analytics", version: "1.5.3" });
 
   async init(): Promise<void> {
     const client = new ZohoAnalyticsClient({
