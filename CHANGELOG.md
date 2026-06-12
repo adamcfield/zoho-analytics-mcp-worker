@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.5.2 — Final sweep (dry: 3 nits, zero behavioral findings)
+
+The final full-coverage sweep confirmed zero critical/major/minor findings — only 3 cosmetic
+nits, all fixed: empty-array spreads in the sharing tools now use the `.length` convention
+uniformly (and the shared email schema requires at least one address); the share-paths
+regression test also asserts HTTP verbs; the README enumerations include all 144 tools
+(zoho_get_query_table, zoho_rename_group, zoho_get_slideshow, zoho_get_variable were missing
+from their category lists). The sweep independently re-verified: 144 tools (51 read / 93
+write), 59/59 tests, 161/161 spec endpoints covered, version consistency.
+
 ## 1.5.1 — Sweep round 3 (2 confirmed findings fixed)
 
 Round 3 of the repetitive sweep came back nearly dry: 2 confirmed findings, both fixed.

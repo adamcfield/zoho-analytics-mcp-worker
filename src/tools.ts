@@ -192,7 +192,7 @@ export function registerTools(
   // can never override the keys that dry_run/audit/validation were computed from.
   const adv = (base: Record<string, unknown>, options?: Record<string, unknown>) => ({ ...(options ?? {}), ...base });
   const ID = (label: string) => z.string().describe(label);
-  const emails = z.array(z.string()).describe("Email address(es).");
+  const emails = z.array(z.string()).min(1).describe("Email address(es).");
   const advOpt = z
     .record(z.string(), z.unknown())
     .optional()
@@ -1608,7 +1608,7 @@ export function registerTools(
         client.updateSharedViews(
           workspace_id,
           view_id,
-          adv({ permissions, ...(email_ids ? { emailIds: email_ids } : {}), ...(group_ids ? { groupIds: group_ids } : {}) }, options),
+          adv({ permissions, ...(email_ids?.length ? { emailIds: email_ids } : {}), ...(group_ids?.length ? { groupIds: group_ids } : {}) }, options),
         ),
       );
     },
@@ -1645,7 +1645,7 @@ export function registerTools(
           emailIds: email_ids,
           ...(view_ids?.length ? { viewIds: view_ids } : {}),
           ...(remove_all_views ? { removeAllViews: true } : {}),
-          ...(group_ids ? { groupIds: group_ids } : {}),
+          ...(group_ids?.length ? { groupIds: group_ids } : {}),
         }),
       );
     },

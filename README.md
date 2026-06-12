@@ -147,11 +147,11 @@ When `MCP_READONLY=true`, none of these are registered — they never even appea
 
 ### Modeling & schema (writes)
 
-Build and reshape data models. Query tables: `zoho_create_query_table`, `zoho_edit_query_table`. Reports: `zoho_create_report`, `zoho_update_report`. Columns: `zoho_add_column`, `zoho_rename_column`, `zoho_delete_column`, `zoho_hide_columns`, `zoho_show_columns`, `zoho_reorder_columns`, `zoho_add_lookup`, `zoho_remove_lookup`. Formulas: `zoho_add_formula_column`, `zoho_delete_formula_column`, `zoho_add_aggregate_formula`, `zoho_delete_aggregate_formula`. Folders: `zoho_create_folder`, `zoho_rename_folder`, `zoho_delete_folder`. View lifecycle: `zoho_rename_view`, `zoho_save_as_view`, `zoho_move_views_to_folder`, `zoho_sort_data`, `zoho_create_table_from_data`, and trash ops `zoho_get_trash` · `zoho_restore_view` · `zoho_delete_trash_view`. Workspace admin: `zoho_rename_workspace`, `zoho_delete_workspace`, `zoho_copy_workspace`, `zoho_copy_views`, `zoho_regenerate_workspace_secret_key` (rotates/invalidates the key). Plus reads `zoho_get_workspace_secret_key`, `zoho_list_folders`, `zoho_get_view_metadata`, `zoho_list_dashboards`, `zoho_list_recent_views`, `zoho_list_datasources`.
+Build and reshape data models. Query tables: `zoho_get_query_table`, `zoho_create_query_table`, `zoho_edit_query_table`. Reports: `zoho_create_report`, `zoho_update_report`. Columns: `zoho_add_column`, `zoho_rename_column`, `zoho_delete_column`, `zoho_hide_columns`, `zoho_show_columns`, `zoho_reorder_columns`, `zoho_add_lookup`, `zoho_remove_lookup`. Formulas: `zoho_add_formula_column`, `zoho_delete_formula_column`, `zoho_add_aggregate_formula`, `zoho_delete_aggregate_formula`. Folders: `zoho_create_folder`, `zoho_rename_folder`, `zoho_delete_folder`. View lifecycle: `zoho_rename_view`, `zoho_save_as_view`, `zoho_move_views_to_folder`, `zoho_sort_data`, `zoho_create_table_from_data`, and trash ops `zoho_get_trash` · `zoho_restore_view` · `zoho_delete_trash_view`. Workspace admin: `zoho_rename_workspace`, `zoho_delete_workspace`, `zoho_copy_workspace`, `zoho_copy_views`, `zoho_regenerate_workspace_secret_key` (rotates/invalidates the key). Plus reads `zoho_get_workspace_secret_key`, `zoho_list_folders`, `zoho_get_view_metadata`, `zoho_list_dashboards`, `zoho_list_recent_views`, `zoho_list_datasources`.
 
 ### Sharing & collaboration
 
-`zoho_share_views`, `zoho_update_shared_views`, `zoho_remove_share`, `zoho_get_shared_details`, `zoho_get_my_permissions`. Groups: `zoho_list_groups`, `zoho_create_group`, `zoho_delete_group`, `zoho_add_group_members`, `zoho_remove_group_members`. Admins: `zoho_get_workspace_admins`, `zoho_add_workspace_admins`, `zoho_remove_workspace_admins`, `zoho_get_org_admins`. Permissions are a boolean map (`read` required; also `export`, `vud`, `addRow`, `drillDown`, `share`, …).
+`zoho_share_views`, `zoho_update_shared_views`, `zoho_remove_share`, `zoho_get_shared_details`, `zoho_get_my_permissions`. Groups: `zoho_list_groups`, `zoho_create_group`, `zoho_rename_group`, `zoho_delete_group`, `zoho_add_group_members`, `zoho_remove_group_members`. Admins: `zoho_get_workspace_admins`, `zoho_add_workspace_admins`, `zoho_remove_workspace_admins`, `zoho_get_org_admins`. Permissions are a boolean map (`read` required; also `export`, `vud`, `addRow`, `drillDown`, `share`, …).
 
 ### User management
 
@@ -159,11 +159,11 @@ Org: `zoho_list_users`, `zoho_add_users`, `zoho_remove_users`, `zoho_set_users_s
 
 ### Publishing & embedding
 
-`zoho_get_view_url`, `zoho_get_embed_url`, `zoho_get_private_url`, `zoho_create_private_url`, `zoho_remove_private_url`, `zoho_make_view_public`, `zoho_remove_public`, `zoho_get_publish_config`, `zoho_update_publish_config`. Slideshows: `zoho_list_slideshows`, `zoho_create_slideshow`, `zoho_update_slideshow`, `zoho_delete_slideshow`, `zoho_get_slideshow_url`.
+`zoho_get_view_url`, `zoho_get_embed_url`, `zoho_get_private_url`, `zoho_create_private_url`, `zoho_remove_private_url`, `zoho_make_view_public`, `zoho_remove_public`, `zoho_get_publish_config`, `zoho_update_publish_config`. Slideshows: `zoho_list_slideshows`, `zoho_get_slideshow`, `zoho_create_slideshow`, `zoho_update_slideshow`, `zoho_delete_slideshow`, `zoho_get_slideshow_url`.
 
 ### Variables
 
-`zoho_list_variables`, `zoho_create_variable`, `zoho_update_variable`, `zoho_delete_variable`.
+`zoho_list_variables`, `zoho_get_variable`, `zoho_create_variable`, `zoho_update_variable`, `zoho_delete_variable`.
 
 ### Dependents, formulas & analysis
 

@@ -510,6 +510,10 @@ describe("sweep round 1 regressions", () => {
     expect(urls[0]).toMatch(/\/workspaces\/W\/share$/);
     expect(urls[1]).toMatch(/\/workspaces\/W\/share$/);
     expect(urls[2]).toContain("/workspaces/W/views/V1/share");
+    // Verbs matter as much as paths for this fix.
+    expect(f.mock.calls[0][1]?.method).toBe("POST");
+    expect(f.mock.calls[1][1]?.method).toBe("DELETE");
+    expect(f.mock.calls[2][1]?.method).toBe("PUT");
   });
 
   it("getDatasources is workspace-scoped (live-docs path)", async () => {
