@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.4.0 — Sweep round 1 (29 confirmed findings fixed)
+
+First round of the repetitive full-coverage sweep (7 inspectors over every file, each finding
+adversarially verified): 29 confirmed, 2 rejected. All fixed.
+
+### Fixed (functional / reliability)
+- **Poisoned-token self-heal:** on a 401, the retry no longer re-adopts the same dead token from
+  the shared KV store — it bypasses the store, mints fresh, and overwrites the poisoned entry
+  (was: up to ~59 min of unrecoverable failures; a regression introduced by the v1.3.0 KV cache).
+- **Timeout now covers the body read** (was disarmed at headers-received, so a stalled body hung
+  unbounded) in both core() and the token refresh; a throwing TokenStore.set no longer fails a
+  request whose token was already minted.
+- **Live-docs path corrections:** makeDefaultFolder is PUT (not POST); sortData uses the standard
+  CONFIG form transport (not a raw JSON body) and takes column IDS (tool description fixed).
+- **Oversized responses refused via Content-Length before the body is read** (10MB) on sync
+  export + bulk download, complementing the post-read guard; guard message no longer recommends
+  nonexistent download paging.
+- Key regeneration GET is never auto-retried (a retry could rotate twice); negative Retry-After
+  clamped; requestRaw stringifies structured errorMessage; zero-row JSON downloads no longer
+  misreported as CSV.
+
+### Safety / security
+- `zoho_import_data` options can no longer override the validated importType (merge order);
+  `zoho_delete_rows` rejects criteria + delete_all_rows together; dry_run + audit added to the
+  three cascade-delete tools (formula/aggregate/lookup with deleteDependentViews) and audit to
+  the privilege-granting tools (add admins/users, role changes).
+- OAuth worker: consent round-trip is UTF-8-safe (btoa threw a 500 on a unicode OAuth state);
+  IPv6 lockout buckets by /64 (per-address buckets were trivially bypassable); bearer scheme
+  match is case-insensitive per RFC 7235.
+
+### Completeness (140 → 144 tools: 51 read / 93 write)
+- New: `zoho_get_query_table` (read SQL before editing), `zoho_rename_group`,
+  `zoho_get_slideshow`, `zoho_get_variable`.
+- Extended: `zoho_list_workspaces` scope (owned/shared), `zoho_get_shared_details` workspace-wide
+  when view_ids omitted, `zoho_list_views` pagination (start_index/no_of_result),
+  `zoho_update_report` axis_columns now required (per spec).
+- CI validates the smoke script (`node --check`); README/docs corrected (headline scoped to the
+  client, deploy.yml documented); **56 tests**.
+
 ## 1.3.0 — Production hardening (second adversarial review + live verification)
 
 A 4-dimension adversarial review (v1.2.0 diff, production ops, security, MCP-consumer quality)

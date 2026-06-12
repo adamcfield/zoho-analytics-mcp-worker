@@ -12,9 +12,9 @@
  * are skipped), and zoho_whoami (which validates the Zoho OAuth credentials
  * end-to-end). Exits non-zero if any check fails.
  */
-const URL = process.env.MCP_URL;
+const ENDPOINT = process.env.MCP_URL; // not named URL — that would shadow the global URL constructor
 const TOKEN = process.env.MCP_TOKEN;
-if (!URL || !TOKEN) {
+if (!ENDPOINT || !TOKEN) {
   console.error("Set MCP_URL and MCP_TOKEN env vars.");
   process.exit(2);
 }
@@ -37,7 +37,7 @@ let sessionId = null;
 async function rpc(body) {
   const headers = { ...BASE_HEADERS };
   if (sessionId) headers["mcp-session-id"] = sessionId;
-  const res = await fetch(URL, { method: "POST", headers, body: JSON.stringify(body) });
+  const res = await fetch(ENDPOINT, { method: "POST", headers, body: JSON.stringify(body) });
   const sid = res.headers.get("mcp-session-id");
   if (sid) sessionId = sid;
   return { status: res.status, body: parse(await res.text()) };
@@ -90,7 +90,7 @@ const tools = list.body?.result?.tools ?? [];
 // Detect a read-only (MCP_READONLY=true) deployment by the absence of write tools.
 const readonly = !WRITE_TOOLS.some((t) => tools.some((x) => x.name === t));
 if (readonly) console.log("note: read-only deployment detected — skipping write-tool checks");
-// Full deploy registers ~140 tools; MCP_READONLY trims to ~48 reads.
+// Full deploy registers ~144 tools; MCP_READONLY trims to ~51 reads.
 check("tools/list", tools.length >= (readonly ? 40 : 130), `(${tools.length} tools)`);
 for (const t of READ_TOOLS) check(`tool present: ${t}`, tools.some((x) => x.name === t));
 if (!readonly) for (const t of WRITE_TOOLS) check(`tool present: ${t}`, tools.some((x) => x.name === t));

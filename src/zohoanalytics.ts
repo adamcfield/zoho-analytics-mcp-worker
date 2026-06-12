@@ -178,14 +178,16 @@ export interface ZohoAnalyticsClientOptions {
 interface CoreOptions {
   /** Object serialized into the CONFIG parameter (query for GET/multipart, form body otherwise). */
   config?: unknown;
-  /** Raw JSON request body (the few endpoints that take application/json, e.g. sort). */
-  jsonBody?: unknown;
   /** Multipart form (bulk import). When present, CONFIG rides in the query string. */
   form?: FormData;
   /** Extra request headers (e.g. ZANALYTICS-DEST-ORGID for cross-org copies). */
   headers?: Record<string, string>;
   /** Read the response as binary and return it base64-encoded (template export ZIPs). */
   binary?: boolean;
+  /** Refuse OK responses whose declared Content-Length exceeds this (bytes). */
+  maxBodyBytes?: number;
+  /** Disable transient GET retry (for GETs with side effects, e.g. key rotation). */
+  neverRetry?: boolean;
 }
 
 /** Base64-encode an ArrayBuffer in chunks (btoa exists in Workers and Node >= 16). */
@@ -218,6 +220,10 @@ export class ZohoAnalyticsClient {
   private refreshPromise?: Promise<string>;
   // Optional cross-instance token cache (KV) shared by all sessions.
   private tokenStore?: TokenStore;
+  // A token that just 401'd: the next acquire must NOT re-adopt it from the
+  // store (the store may still hold it with a future expiry), or the 401
+  // retry would re-send the same dead token and self-heal would be disabled.
+  private lastRejectedToken?: string;
 
   constructor(opts: ZohoAnalyticsClientOptions) {
     const hasRefresh = !!(opts.refreshToken && opts.clientId && opts.clientSecret);
@@ -271,15 +277,26 @@ export class ZohoAnalyticsClient {
   private async acquireAccessToken(): Promise<string> {
     if (this.tokenStore) {
       const stored = await this.tokenStore.get();
-      if (stored && Date.now() < stored.expiry - 60_000) {
+      if (
+        stored &&
+        Date.now() < stored.expiry - 60_000 &&
+        stored.token !== this.lastRejectedToken // never re-adopt a token that just 401'd
+      ) {
         this.accessToken = stored.token;
         this.accessTokenExpiry = stored.expiry;
         return stored.token;
       }
     }
     const token = await this.refreshAccessToken();
+    this.lastRejectedToken = undefined;
     if (this.tokenStore) {
-      await this.tokenStore.set(token, this.accessTokenExpiry);
+      // Best-effort: overwrites a poisoned entry so other sessions heal too. A
+      // throwing store must not fail the request — the token itself is valid.
+      try {
+        await this.tokenStore.set(token, this.accessTokenExpiry);
+      } catch {
+        /* best-effort */
+      }
     }
     return token;
   }
@@ -310,8 +327,7 @@ export class ZohoAnalyticsClient {
           body: params.toString(),
           signal: controller.signal,
         });
-        clearTimeout(timer);
-        const text = await res.text();
+        const text = await res.text(); // timer stays armed through the body read
         let data: Record<string, unknown> = {};
         try {
           data = text ? JSON.parse(text) : {};
@@ -329,8 +345,9 @@ export class ZohoAnalyticsClient {
         lastErr = `${errCode}${text && !data.error ? `: ${text}` : ""}`;
         if (res.status < 500 && res.status !== 429) break; // permanent client error -> don't retry (429 is transient)
       } catch (err) {
-        clearTimeout(timer);
         lastErr = err instanceof Error ? err.message : String(err);
+      } finally {
+        clearTimeout(timer);
       }
       if (attempt < 2) await sleep(this.backoffBaseMs * (attempt + 1));
     }
@@ -354,9 +371,9 @@ export class ZohoAnalyticsClient {
     let delayMs: number;
     const secs = retryAfter ? Number(retryAfter) : NaN;
     if (Number.isFinite(secs)) {
-      // Cap server-provided Retry-After so a 429 inside a polling tool call
-      // can't sleep past the caller's deadline / the MCP client's timeout.
-      delayMs = Math.min(secs * 1000, 8000);
+      // Clamp to [0, 8s]: a malformed negative Retry-After must not skip the
+      // backoff, and a huge one must not sleep past the caller's deadline.
+      delayMs = Math.min(Math.max(secs, 0) * 1000, 8000);
     } else {
       delayMs = Math.min(this.backoffBaseMs * 2 ** attempt, 8000);
     }
@@ -377,15 +394,12 @@ export class ZohoAnalyticsClient {
     // CONFIG placement: query string for GET and for multipart (import); form body otherwise.
     const configInQuery = !!opts.form || method === "GET";
     const url = this.buildUrl(path, opts.config !== undefined && configInQuery ? opts.config : undefined);
-    const isIdempotent = method === "GET";
+    const isIdempotent = method === "GET" && !opts.neverRetry;
 
     let body: BodyInit | undefined;
     let contentType: string | undefined;
     if (opts.form) {
       body = opts.form; // multipart; let fetch set the boundary
-    } else if (opts.jsonBody !== undefined) {
-      body = JSON.stringify(opts.jsonBody);
-      contentType = "application/json";
     } else if (opts.config !== undefined && !configInQuery) {
       body = `CONFIG=${encodeURIComponent(JSON.stringify(opts.config))}`;
       contentType = "application/x-www-form-urlencoded";
@@ -412,10 +426,24 @@ export class ZohoAnalyticsClient {
       if (opts.headers) Object.assign(headers, opts.headers);
 
       const controller = new AbortController();
+      // The timer stays armed until the BODY is fully read (cleared in finally) —
+      // clearing it at headers-received would leave a stalled body read unbounded.
       const timer = setTimeout(() => controller.abort(), this.timeoutMs);
       try {
         const res = await fetch(url, { method, headers, body, signal: controller.signal });
-        clearTimeout(timer);
+        // Refuse oversized bodies before reading when the server declares a length
+        // (the read itself would buffer the whole body in DO memory).
+        const declared = Number(res.headers.get("content-length"));
+        if (opts.maxBodyBytes && res.ok && Number.isFinite(declared) && declared > opts.maxBodyBytes) {
+          controller.abort();
+          throw new ZohoAnalyticsError(
+            res.status,
+            null,
+            `Response is ${Math.round(declared / 1_000_000)}MB — exceeds the ${Math.round(opts.maxBodyBytes / 1_000_000)}MB limit. Narrow the export (criteria/selected_columns or LIMIT in SQL).`,
+            method,
+            path,
+          );
+        }
         // Binary reads only apply to OK responses; error bodies stay text so the
         // failure envelope can be parsed. A body starting with "{" is a JSON
         // envelope (Zoho reports some failures with HTTP 200), never a ZIP — decode
@@ -429,9 +457,12 @@ export class ZohoAnalyticsClient {
         }
 
         // The token may have been revoked/expired server-side before our cached
-        // expiry. Refresh once and retry immediately.
+        // expiry. Refresh once and retry immediately. Marking the token rejected
+        // makes acquireAccessToken bypass the shared store (which may still hold
+        // this exact token) and mint fresh.
         if (res.status === 401 && !refreshed && !this.staticAccessToken) {
           refreshed = true;
+          this.lastRejectedToken = token;
           this.accessToken = undefined;
           this.accessTokenExpiry = 0;
           continue;
@@ -443,13 +474,15 @@ export class ZohoAnalyticsClient {
         }
         await this.backoff(attempt, res.headers.get("retry-after"));
       } catch (err) {
-        clearTimeout(timer);
+        if (err instanceof ZohoAnalyticsError) throw err; // our own size-limit abort
         // Network error or timeout (AbortError). Retry idempotent calls only.
         if (!isIdempotent || attempt >= this.maxRetries) {
           const reason = err instanceof Error ? err.message : String(err);
           throw new Error(`Zoho Analytics request failed (${method} ${path}): ${reason}`);
         }
         await this.backoff(attempt, null);
+      } finally {
+        clearTimeout(timer);
       }
     }
   }
@@ -482,9 +515,16 @@ export class ZohoAnalyticsClient {
     const { res, text } = await this.core(method, path, opts);
     const asFailure = () => {
       try {
-        const p = JSON.parse(text) as { status?: string; data?: { errorCode?: number; errorMessage?: string } };
+        const p = JSON.parse(text) as { status?: string; data?: { errorCode?: number; errorMessage?: unknown } };
         if (p?.status === "failure") {
-          return new ZohoAnalyticsError(res.status, p.data?.errorCode ?? null, p.data?.errorMessage ?? text, method, path);
+          const msg = p.data?.errorMessage ?? text;
+          return new ZohoAnalyticsError(
+            res.status,
+            p.data?.errorCode ?? null,
+            typeof msg === "string" ? msg : JSON.stringify(msg),
+            method,
+            path,
+          );
         }
       } catch {
         /* not an envelope */
@@ -563,7 +603,10 @@ export class ZohoAnalyticsClient {
    * Dashboard/Query-Table views — use the bulk export job for those.
    */
   exportData(workspaceId: string, viewId: string, config: Config): Promise<string> {
-    return this.requestRaw("GET", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/data`, { config });
+    return this.requestRaw("GET", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/data`, {
+      config,
+      maxBodyBytes: 10_000_000,
+    });
   }
   /** Add a single row. config: { columns: { name: value, ... }, dateFormat? }. */
   addRow(workspaceId: string, viewId: string, config: Config) {
@@ -577,9 +620,9 @@ export class ZohoAnalyticsClient {
   deleteRows(workspaceId: string, viewId: string, config: Config) {
     return this.request("DELETE", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/rows`, { config });
   }
-  /** Sort a view's data. Takes a raw JSON body: { columns, sortOrder (1=asc,2=desc), resetSort? }. */
-  sortData(workspaceId: string, viewId: string, body: Config) {
-    return this.request("PUT", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/data/sort`, { jsonBody: body });
+  /** Sort a view's data. config: { columns (column IDS), sortOrder (1=asc,2=desc), resetSort? } — standard CONFIG transport per the live docs. */
+  sortData(workspaceId: string, viewId: string, config: Config) {
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/views/${enc(viewId)}/data/sort`, { config });
   }
 
   // ============================ Bulk API (asynchronous) ============================
@@ -600,7 +643,9 @@ export class ZohoAnalyticsClient {
   }
   /** Download a completed export job's data (raw body). */
   downloadExportData(workspaceId: string, jobId: string): Promise<string> {
-    return this.requestRaw("GET", `/bulk/workspaces/${enc(workspaceId)}/exportjobs/${enc(jobId)}/data`);
+    return this.requestRaw("GET", `/bulk/workspaces/${enc(workspaceId)}/exportjobs/${enc(jobId)}/data`, {
+      maxBodyBytes: 10_000_000,
+    });
   }
   /**
    * Create a bulk import job. The file rides as a multipart field named FILE.
@@ -654,7 +699,10 @@ export class ZohoAnalyticsClient {
   }
   /** Get (or regenerate, with config { regenerateKey: true }) the workspace secret key for cross-org copies. */
   getWorkspaceSecretKey(workspaceId: string, config?: Config) {
-    return this.request("GET", `/workspaces/${enc(workspaceId)}/secretkey`, { config });
+    // Regeneration is a state-changing GET — never auto-retry it (a retry could
+    // rotate twice, or rotate after a reported failure).
+    const regenerates = !!(config as { regenerateKey?: boolean } | undefined)?.regenerateKey;
+    return this.request("GET", `/workspaces/${enc(workspaceId)}/secretkey`, { config, neverRetry: regenerates });
   }
   /** Copy views to another workspace/org. config: { viewIds, destWorkspaceId, workspaceKey?, copyWithData? }. destOrgId required. */
   copyViews(workspaceId: string, config: Config, destOrgId: string) {
@@ -1054,8 +1102,9 @@ export class ZohoAnalyticsClient {
 
   // ============================ Modeling: folders / formulas / analysis ============================
 
+  /** PUT per Zoho's live docs + SDK (their OAS says POST). */
   makeDefaultFolder(workspaceId: string, folderId: string) {
-    return this.request("POST", `/workspaces/${enc(workspaceId)}/folders/${enc(folderId)}/default`);
+    return this.request("PUT", `/workspaces/${enc(workspaceId)}/folders/${enc(folderId)}/default`);
   }
   /** Change folder hierarchy. config: { hierarchy (0=parent, 1=child), parentFolderId? }. */
   moveFolder(workspaceId: string, folderId: string, config: Config) {

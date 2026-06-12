@@ -44,8 +44,8 @@ const MAX_EXPORT_BODY_CHARS = 10_000_000;
 function guardExportSize(size: number): void {
   if (size <= MAX_EXPORT_BODY_CHARS) return;
   throw new Error(
-    `Export body is ${Math.round(size / 1_000_000)}MB — too large to parse in the Worker. ` +
-      `Narrow it with criteria/selected_columns (or LIMIT in SQL), or use zoho_create_export_job with response_format=csv and page the download.`,
+    `Export body is ${Math.round(size / 1_000_000)}MB — too large to handle in the Worker. ` +
+      `Narrow it with criteria/selected_columns, use LIMIT/OFFSET in SQL (via zoho_query_data), or split the export into criteria ranges — the download endpoint itself has no paging.`,
   );
 }
 
@@ -233,15 +233,20 @@ export function registerTools(
     "zoho_list_workspaces",
     {
       description:
-        "List all workspaces (databases) — both owned and shared. Returns compact { workspaceId, workspaceName } entries by default; set verbose=true for the full objects. Workspaces contain the views (tables, query tables, dashboards) you query.",
+        "List workspaces (databases). scope: all (default), owned, or shared. Returns compact { workspaceId, workspaceName } entries by default; set verbose=true for the full objects. Workspaces contain the views (tables, query tables, dashboards) you query.",
       inputSchema: {
+        scope: z.enum(["all", "owned", "shared"]).optional().describe("Which workspaces to list (default all)."),
         verbose: z.boolean().optional().describe("Return full workspace objects instead of compact id/name."),
       },
       annotations: { title: "List workspaces", ...READ_ONLY },
     },
-    async ({ verbose }) =>
+    async ({ scope, verbose }) =>
       run(async () => {
-        const res = (await client.getWorkspaces()) as AnyRec;
+        const res = (await (scope === "owned"
+          ? client.getOwnedWorkspaces()
+          : scope === "shared"
+            ? client.getSharedWorkspaces()
+            : client.getWorkspaces())) as AnyRec;
         const data = res?.data ?? res;
         if (verbose) return data;
         const trim = (ws: AnyRec[] | undefined) =>
@@ -275,17 +280,21 @@ export function registerTools(
           .optional()
           .describe("Restrict to these view types."),
         keyword: z.string().optional().describe("Filter views whose name contains this keyword."),
+        start_index: z.number().int().min(0).optional().describe("Pagination offset."),
+        no_of_result: z.number().int().min(1).optional().describe("Pagination page size."),
         verbose: z.boolean().optional().describe("Return full view objects instead of compact id/name/type."),
       },
       annotations: { title: "List views", ...READ_ONLY },
     },
-    async ({ workspace_id, view_types, keyword, verbose }) =>
+    async ({ workspace_id, view_types, keyword, start_index, no_of_result, verbose }) =>
       run(async () => {
         const nameToCode: Record<string, number> = {};
         for (const [code, name] of Object.entries(VIEW_TYPE_NAMES)) nameToCode[name] = Number(code);
         const config: Record<string, unknown> = {};
         if (view_types?.length) config.viewTypes = view_types.map((t) => nameToCode[t]).filter((n) => n !== undefined);
         if (keyword) config.keyword = keyword;
+        if (start_index != null) config.startIndex = start_index;
+        if (no_of_result != null) config.noOfResult = no_of_result;
         const res = (await client.getViews(workspace_id, Object.keys(config).length ? config : undefined)) as AnyRec;
         const views: AnyRec[] = res?.data?.views ?? res?.data ?? [];
         if (verbose) return res?.data ?? res;
@@ -409,7 +418,7 @@ export function registerTools(
         workspace_id: z.string().describe("Workspace id to run the query against."),
         sql_query: z.string().describe('SQL SELECT. Quote identifiers: SELECT "col" FROM "Table" WHERE ...'),
         max_rows: z.number().int().min(1).max(100000).optional().describe("Max rows to return (default 1000). Also consider LIMIT in SQL."),
-        timeout_seconds: z.number().int().min(1).max(60).optional().describe("Max seconds to wait for the export job (default 30, hard cap 60)."),
+        timeout_seconds: z.number().int().min(1).max(60).optional().describe("Approximate max seconds to wait (default 30, cap 60; a slow status call can overrun slightly)."),
       },
       annotations: { title: "Query data (SQL)", ...READ_ONLY },
     },
@@ -505,6 +514,10 @@ export function registerTools(
         const raw = await client.downloadExportData(workspace_id, job_id);
         guardExportSize(raw.length);
         const { rows, raw: rawJson } = parseExportRows(raw);
+        if (rows.length === 0 && rawJson === undefined) {
+          // Parsed JSON with genuinely zero rows.
+          return { ...status, row_count: 0, rows: [] };
+        }
         if (rows.length === 0) {
           // CSV (or unrecognized) — return raw text, capped.
           const text = rawJson ?? raw;
@@ -623,6 +636,9 @@ export function registerTools(
       if (!criteria && !delete_all_rows) {
         return fail("Provide `criteria` to target rows, or pass delete_all_rows=true to delete every row.");
       }
+      if (criteria && delete_all_rows) {
+        return fail("Pass either `criteria` OR delete_all_rows=true — not both (ambiguous).");
+      }
       if (dry_run) {
         return ok({
           dry_run: true,
@@ -656,7 +672,7 @@ export function registerTools(
         on_error: z.enum(["abort", "skiprow", "setcolumnempty"]).optional().describe("Behavior on a bad row (default abort)."),
         options: advOpt,
         wait: z.boolean().optional().describe("Wait for the job to complete and return its summary (default true)."),
-        timeout_seconds: z.number().int().min(1).max(60).optional().describe("Max seconds to wait when wait=true (default 30, cap 60)."),
+        timeout_seconds: z.number().int().min(1).max(60).optional().describe("Approximate max seconds to wait when wait=true (default 30, cap 60; a slow status call can overrun slightly)."),
         dry_run: z.boolean().optional().describe("Preview the import config without uploading anything."),
       },
       annotations: { title: "Import data (bulk)", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
@@ -686,14 +702,16 @@ export function registerTools(
         });
       }
       audit("import_data", { workspace_id: a.workspace_id, view_id: a.view_id, import_type: importType, mode, bytes: a.data.length });
+      // options merges FIRST so it can never override the validated safety keys
+      // (importType etc.) that dry_run/audit/validation were computed from.
       const config: Record<string, unknown> = {
+        ...(a.options ?? {}),
         importType,
         fileType,
         autoIdentify: String(a.auto_identify ?? true),
         onError: a.on_error ?? "abort",
       };
       if (a.matching_columns?.length) config.matchingColumns = a.matching_columns;
-      if (a.options) Object.assign(config, a.options);
       const file = { content: a.data, name: `import.${fileType}`, type: fileType === "json" ? "application/json" : "text/csv" };
       if (mode === "sync") {
         return run(() => client.importDataSync(a.workspace_id, a.view_id, file, config));
@@ -900,10 +918,21 @@ export function registerTools(
     },
   );
 
+  server.registerTool(
+    "zoho_get_query_table",
+    {
+      description: "Get a query table's details, including its CURRENT SQL — read this before zoho_edit_query_table, which overwrites the SQL completely.",
+      inputSchema: { workspace_id: ID("Workspace id."), query_table_id: ID("Query table view id.") },
+      annotations: { title: "Get query table", ...READ_ONLY },
+    },
+    async ({ workspace_id, query_table_id }) => run(() => client.getQueryTableDetails(workspace_id, query_table_id)),
+  );
+
   writeTool(
     "zoho_edit_query_table",
     {
-      description: "Edit an existing query table's SQL (and optionally move it to a folder).",
+      description:
+        "Edit an existing query table's SQL (and optionally move it to a folder). This REPLACES the whole SQL — read the current SQL first with zoho_get_query_table.",
       inputSchema: {
         workspace_id: ID("Workspace id."),
         query_table_id: ID("Query table view id."),
@@ -957,13 +986,14 @@ export function registerTools(
   writeTool(
     "zoho_update_report",
     {
-      description: "Update an existing report's title/type/axes. Pass axis_columns to redefine the axes; use options for filters and merge settings.",
+      description:
+        "Update an existing report's axes (and optionally title/type). axis_columns is REQUIRED by the API even for a rename — pass the full current axis definition; use options for filters and merge settings.",
       inputSchema: {
         workspace_id: ID("Workspace id."),
         report_id: ID("Report view id."),
+        axis_columns: z.array(z.record(z.string(), z.unknown())).min(1).describe("Full axis definition (required by the API on every update)."),
         title: z.string().optional(),
         report_type: z.enum(["chart", "pivot", "summary"]).optional(),
-        axis_columns: z.array(z.record(z.string(), z.unknown())).optional(),
         options: advOpt,
       },
       annotations: { title: "Update report", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
@@ -1101,17 +1131,21 @@ export function registerTools(
   writeTool(
     "zoho_remove_lookup",
     {
-      description: "Remove a lookup relationship from a column.",
+      description: "Remove a lookup relationship from a column. delete_dependent_views=true also removes every dependent view — preview with dry_run.",
       inputSchema: {
         workspace_id: ID("Workspace id."),
         view_id: ID("Table id."),
         column_id: ID("Column id."),
         delete_dependent_views: z.boolean().optional(),
+        dry_run: z.boolean().optional(),
       },
       annotations: { title: "Remove lookup", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
-    async ({ workspace_id, view_id, column_id, delete_dependent_views }) =>
-      run(() => client.removeLookup(workspace_id, view_id, column_id, delete_dependent_views ? { deleteDependentViews: true } : undefined)),
+    async ({ workspace_id, view_id, column_id, delete_dependent_views, dry_run }) => {
+      if (dry_run) return ok({ dry_run: true, action: "remove_lookup", column_id, delete_dependent_views: !!delete_dependent_views, note: "Nothing was removed." });
+      audit("remove_lookup", { workspace_id, view_id, column_id, cascade: !!delete_dependent_views });
+      return run(() => client.removeLookup(workspace_id, view_id, column_id, delete_dependent_views ? { deleteDependentViews: true } : undefined));
+    },
   );
 
   // ============================ Modeling: formulas ============================
@@ -1136,17 +1170,21 @@ export function registerTools(
   writeTool(
     "zoho_delete_formula_column",
     {
-      description: "Delete an inline formula column by its formula id.",
+      description: "Delete an inline formula column by its formula id. delete_dependent_views=true also removes every dependent view — preview with dry_run.",
       inputSchema: {
         workspace_id: ID("Workspace id."),
         view_id: ID("Table id."),
         formula_id: ID("Formula id."),
         delete_dependent_views: z.boolean().optional(),
+        dry_run: z.boolean().optional(),
       },
       annotations: { title: "Delete formula column", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
-    async ({ workspace_id, view_id, formula_id, delete_dependent_views }) =>
-      run(() => client.deleteFormulaColumn(workspace_id, view_id, formula_id, delete_dependent_views ? { deleteDependentViews: true } : undefined)),
+    async ({ workspace_id, view_id, formula_id, delete_dependent_views, dry_run }) => {
+      if (dry_run) return ok({ dry_run: true, action: "delete_formula_column", formula_id, delete_dependent_views: !!delete_dependent_views, note: "Nothing was deleted." });
+      audit("delete_formula_column", { workspace_id, view_id, formula_id, cascade: !!delete_dependent_views });
+      return run(() => client.deleteFormulaColumn(workspace_id, view_id, formula_id, delete_dependent_views ? { deleteDependentViews: true } : undefined));
+    },
   );
 
   writeTool(
@@ -1169,17 +1207,21 @@ export function registerTools(
   writeTool(
     "zoho_delete_aggregate_formula",
     {
-      description: "Delete an aggregate formula by its id.",
+      description: "Delete an aggregate formula by its id. delete_dependent_views=true also removes every dependent view — preview with dry_run.",
       inputSchema: {
         workspace_id: ID("Workspace id."),
         view_id: ID("Table id."),
         formula_id: ID("Formula id."),
         delete_dependent_views: z.boolean().optional(),
+        dry_run: z.boolean().optional(),
       },
       annotations: { title: "Delete aggregate formula", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
-    async ({ workspace_id, view_id, formula_id, delete_dependent_views }) =>
-      run(() => client.deleteAggregateFormula(workspace_id, view_id, formula_id, delete_dependent_views ? { deleteDependentViews: true } : undefined)),
+    async ({ workspace_id, view_id, formula_id, delete_dependent_views, dry_run }) => {
+      if (dry_run) return ok({ dry_run: true, action: "delete_aggregate_formula", formula_id, delete_dependent_views: !!delete_dependent_views, note: "Nothing was deleted." });
+      audit("delete_aggregate_formula", { workspace_id, view_id, formula_id, cascade: !!delete_dependent_views });
+      return run(() => client.deleteAggregateFormula(workspace_id, view_id, formula_id, delete_dependent_views ? { deleteDependentViews: true } : undefined));
+    },
   );
 
   // ============================ Modeling: folders ============================
@@ -1309,11 +1351,12 @@ export function registerTools(
   writeTool(
     "zoho_sort_data",
     {
-      description: "Sort a view's stored data by one or more columns. sort_order 1=ascending, 2=descending. Set reset=true to clear sorting.",
+      description:
+        "Sort a view's stored data by one or more columns. Pass column IDS (get them from zoho_get_view_metadata), not names. sort_order 1=ascending, 2=descending. Set reset=true to clear sorting.",
       inputSchema: {
         workspace_id: ID("Workspace id."),
         view_id: ID("Table id."),
-        columns: z.array(z.string()).min(1).describe("Column names to sort by."),
+        columns: z.array(z.string()).min(1).describe("Column IDs to sort by (from zoho_get_view_metadata)."),
         sort_order: z.number().int().min(1).max(2).optional().describe("1=ascending (default), 2=descending."),
         reset: z.boolean().optional(),
       },
@@ -1472,11 +1515,13 @@ export function registerTools(
   server.registerTool(
     "zoho_get_shared_details",
     {
-      description: "Get the sharing details for one or more views (who they're shared with and what permissions).",
-      inputSchema: { workspace_id: ID("Workspace id."), view_ids: z.array(z.string()).min(1) },
+      description:
+        "Get sharing details: who views are shared with and what permissions. Pass view_ids for specific views, or omit it for the WHOLE workspace's sharing info (users, groups, public and private-link shares).",
+      inputSchema: { workspace_id: ID("Workspace id."), view_ids: z.array(z.string()).optional().describe("Specific views; omit for workspace-wide sharing info.") },
       annotations: { title: "Get shared details", ...READ_ONLY },
     },
-    async ({ workspace_id, view_ids }) => run(() => client.getSharedDetails(workspace_id, view_ids)),
+    async ({ workspace_id, view_ids }) =>
+      run(() => (view_ids?.length ? client.getSharedDetails(workspace_id, view_ids) : client.getWorkspaceSharedDetails(workspace_id))),
   );
 
   server.registerTool(
@@ -1613,6 +1658,17 @@ export function registerTools(
   );
 
   writeTool(
+    "zoho_rename_group",
+    {
+      description: "Rename a sharing group (and optionally change its description).",
+      inputSchema: { workspace_id: ID("Workspace id."), group_id: ID("Group id."), group_name: z.string(), group_desc: z.string().optional() },
+      annotations: { title: "Rename group", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ workspace_id, group_id, group_name, group_desc }) =>
+      run(() => client.renameGroup(workspace_id, group_id, { groupName: group_name, ...(group_desc ? { groupDesc: group_desc } : {}) })),
+  );
+
+  writeTool(
     "zoho_delete_group",
     {
       description: "Delete a sharing group.",
@@ -1664,8 +1720,10 @@ export function registerTools(
       inputSchema: { workspace_id: ID("Workspace id."), email_ids: emails, invite_mail: z.boolean().optional() },
       annotations: { title: "Add workspace admins", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ workspace_id, email_ids, invite_mail }) =>
-      run(() => client.addWorkspaceAdmins(workspace_id, { emailIds: email_ids, ...(invite_mail != null ? { inviteMail: invite_mail } : {}) })),
+    async ({ workspace_id, email_ids, invite_mail }) => {
+      audit("add_workspace_admins", { workspace_id, count: email_ids.length });
+      return run(() => client.addWorkspaceAdmins(workspace_id, { emailIds: email_ids, ...(invite_mail != null ? { inviteMail: invite_mail } : {}) }));
+    },
   );
 
   writeTool(
@@ -1791,8 +1849,10 @@ export function registerTools(
       inputSchema: { workspace_id: ID("Workspace id."), email_ids: emails, role: z.string().optional() },
       annotations: { title: "Add workspace users", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ workspace_id, email_ids, role }) =>
-      run(() => client.addWorkspaceUsers(workspace_id, { emailIds: email_ids, ...(role ? { role } : {}) })),
+    async ({ workspace_id, email_ids, role }) => {
+      audit("add_workspace_users", { workspace_id, count: email_ids.length, role: role ?? "USER" });
+      return run(() => client.addWorkspaceUsers(workspace_id, { emailIds: email_ids, ...(role ? { role } : {}) }));
+    },
   );
 
   writeTool(
@@ -1823,7 +1883,10 @@ export function registerTools(
       inputSchema: { workspace_id: ID("Workspace id."), email_ids: emails, role: z.string().describe("USER | WORKSPACEADMIN | <custom role>.") },
       annotations: { title: "Change workspace user role", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ workspace_id, email_ids, role }) => run(() => client.changeWorkspaceUsersRole(workspace_id, { emailIds: email_ids, role })),
+    async ({ workspace_id, email_ids, role }) => {
+      audit("change_workspace_user_role", { workspace_id, count: email_ids.length, role });
+      return run(() => client.changeWorkspaceUsersRole(workspace_id, { emailIds: email_ids, role }));
+    },
   );
 
   // ============================ Embed / publish ============================
@@ -1951,6 +2014,16 @@ export function registerTools(
       run(() => client.createSlideshow(workspace_id, { slideName: slide_name, viewIds: view_ids, ...(access_type != null ? { accessType: access_type } : {}) })),
   );
 
+  server.registerTool(
+    "zoho_get_slideshow",
+    {
+      description: "Get a slideshow's details (name, access type, the view ids it contains) — read before zoho_update_slideshow, which replaces fields blind.",
+      inputSchema: { workspace_id: ID("Workspace id."), slide_id: ID("Slideshow id.") },
+      annotations: { title: "Get slideshow", ...READ_ONLY },
+    },
+    async ({ workspace_id, slide_id }) => run(() => client.getSlideshowDetails(workspace_id, slide_id)),
+  );
+
   writeTool(
     "zoho_update_slideshow",
     {
@@ -2035,6 +2108,16 @@ export function registerTools(
           adv({ variableName: variable_name, variableType: variable_type, variableDataType: variable_data_type }, options),
         ),
       ),
+  );
+
+  server.registerTool(
+    "zoho_get_variable",
+    {
+      description: "Get a variable's full definition (type, data type, default/user-specific values) — read before zoho_update_variable.",
+      inputSchema: { workspace_id: ID("Workspace id."), variable_id: ID("Variable id.") },
+      annotations: { title: "Get variable", ...READ_ONLY },
+    },
+    async ({ workspace_id, variable_id }) => run(() => client.getVariableDetails(workspace_id, variable_id)),
   );
 
   writeTool(

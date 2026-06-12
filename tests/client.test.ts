@@ -407,6 +407,78 @@ describe("production hardening", () => {
   });
 });
 
+describe("sweep round 1 regressions", () => {
+  it("401 with a poisoned shared store: bypasses the store, mints fresh, overwrites the store", async () => {
+    let tokenCalls = 0;
+    const f = vi.fn(async (...[url, init]: FetchArgs) => {
+      if (String(url).includes("/oauth/v2/token")) {
+        tokenCalls++;
+        return new Response(JSON.stringify({ access_token: "FRESH", expires_in: 3600 }), { status: 200 });
+      }
+      const auth = (init?.headers as Record<string, string>).Authorization;
+      if (auth === "Zoho-oauthtoken DEAD") return new Response("unauthorized", { status: 401 });
+      return new Response(JSON.stringify({ status: "success", data: {} }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", f);
+    // Store keeps returning the dead token with a future expiry (server-side revocation).
+    const store = {
+      get: vi.fn(async () => ({ token: "DEAD", expiry: Date.now() + 3_000_000 })),
+      set: vi.fn(async () => {}),
+    };
+    const c = new ZohoAnalyticsClient({ clientId: "c", clientSecret: "s", refreshToken: "r", dc: "com", backoffBaseMs: 1, tokenStore: store });
+    await c.getOrgs(); // must self-heal: DEAD -> 401 -> fresh mint -> success
+    expect(tokenCalls).toBe(1);
+    expect(store.set).toHaveBeenCalledWith("FRESH", expect.any(Number)); // poisoned entry overwritten
+    const orgCalls = f.mock.calls.filter((call) => String(call[0]).includes("/restapi/v2/orgs"));
+    expect((orgCalls.at(-1)?.[1]?.headers as Record<string, string>).Authorization).toBe("Zoho-oauthtoken FRESH");
+  });
+
+  it("a throwing TokenStore.set does not fail the request (token already minted)", async () => {
+    const f = vi.fn(async (...[url]: FetchArgs) => {
+      if (String(url).includes("/oauth/v2/token")) {
+        return new Response(JSON.stringify({ access_token: "T", expires_in: 3600 }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: "success", data: { ok: 1 } }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", f);
+    const store = { get: vi.fn(async () => null), set: vi.fn(async () => { throw new Error("kv down"); }) };
+    const c = new ZohoAnalyticsClient({ clientId: "c", clientSecret: "s", refreshToken: "r", dc: "com", backoffBaseMs: 1, tokenStore: store });
+    await expect(c.getOrgs()).resolves.toMatchObject({ status: "success" });
+  });
+
+  it("sortData uses the CONFIG form-body transport (not a raw JSON body)", async () => {
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", f);
+    await mkStatic().sortData("W", "V", { columns: ["123"], sortOrder: 1 });
+    const [, init] = f.mock.calls[0];
+    expect((init?.headers as Record<string, string>)["Content-Type"]).toBe("application/x-www-form-urlencoded");
+    expect(decodeURIComponent(String(init?.body))).toContain('"sortOrder":1');
+  });
+
+  it("makeDefaultFolder uses PUT per the live docs", async () => {
+    const f = vi.fn(async (..._args: FetchArgs) => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", f);
+    await mkStatic().makeDefaultFolder("W", "F");
+    expect(f.mock.calls[0][1]?.method).toBe("PUT");
+    expect(String(f.mock.calls[0][0])).toContain("/folders/F/default");
+  });
+
+  it("key regeneration is never auto-retried (a retry could rotate twice)", async () => {
+    const f = mockSequence([{ status: 500, body: "boom" }]);
+    vi.stubGlobal("fetch", f);
+    await expect(mkStatic().getWorkspaceSecretKey("W", { regenerateKey: true })).rejects.toMatchObject({ status: 500 });
+    expect(f).toHaveBeenCalledTimes(1); // plain reads still retry; regeneration must not
+  });
+
+  it("refuses an oversized export via the declared Content-Length before reading the body", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (..._args: FetchArgs) => new Response("x", { status: 200, headers: { "content-length": "999999999" } })),
+    );
+    await expect(mkStatic().exportData("W", "V", { responseFormat: "csv" })).rejects.toThrow(/exceeds the 10MB limit/);
+  });
+});
+
 describe("ZohoAnalyticsError", () => {
   it("includes method, path, status and errorCode in the message", () => {
     const e = new ZohoAnalyticsError(404, 7103, "not found", "GET", "/workspaces/x");

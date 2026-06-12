@@ -77,7 +77,7 @@ export function clientFromEnv(env: Env): ZohoAnalyticsClient {
 }
 
 export class ZohoAnalyticsMCP extends McpAgent<Env> {
-  server = new McpServer({ name: "zoho-analytics", version: "1.3.0" });
+  server = new McpServer({ name: "zoho-analytics", version: "1.4.0" });
 
   async init(): Promise<void> {
     registerTools(this.server, clientFromEnv(this.env), {
@@ -102,9 +102,10 @@ function authorized(request: Request, env: Env): boolean {
   // Fail closed: if no secret is configured, reject everything.
   if (!env.MCP_AUTH_TOKEN) return false;
   const header = request.headers.get("authorization") ?? "";
-  const prefix = "Bearer ";
-  if (!header.startsWith(prefix)) return false;
-  return safeEqual(header.slice(prefix.length), env.MCP_AUTH_TOKEN);
+  // RFC 7235: the auth-scheme is case-insensitive.
+  const match = /^Bearer\s+(.+)$/i.exec(header);
+  if (!match) return false;
+  return safeEqual(match[1], env.MCP_AUTH_TOKEN);
 }
 
 export default {

@@ -43,7 +43,7 @@ type AuthRequest = Awaited<ReturnType<OAuthHelpers["parseAuthRequest"]>>;
 
 /** The MCP agent — identical tool surface to the bearer worker. */
 export class ZohoAnalyticsMCP extends McpAgent<Env, unknown, Props> {
-  server = new McpServer({ name: "zoho-analytics", version: "1.3.0" });
+  server = new McpServer({ name: "zoho-analytics", version: "1.4.0" });
 
   async init(): Promise<void> {
     const client = new ZohoAnalyticsClient({
@@ -76,6 +76,14 @@ function safeEqual(a: string, b: string): boolean {
   return mismatch === 0;
 }
 
+/** UTF-8-safe base64 round-trip (btoa alone throws on code points > 0xFF, e.g. a unicode OAuth `state`). */
+function b64encodeUtf8(s: string): string {
+  return btoa(String.fromCharCode(...new TextEncoder().encode(s)));
+}
+function b64decodeUtf8(b64: string): string {
+  return new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)));
+}
+
 function escapeHtml(s: string): string {
   return s.replace(
     /[&<>"']/g,
@@ -85,7 +93,7 @@ function escapeHtml(s: string): string {
 
 /** Render the single-user passphrase consent screen. */
 function consentPage(reqInfo: AuthRequest, clientName: string, error: string | null): Response {
-  const req = btoa(JSON.stringify(reqInfo));
+  const req = b64encodeUtf8(JSON.stringify(reqInfo));
   const html = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -142,7 +150,18 @@ const MAX_ATTEMPTS = 10;
 const WINDOW_SECS = 900;
 
 function clientIp(request: Request): string {
-  return request.headers.get("cf-connecting-ip") ?? "unknown";
+  const ip = request.headers.get("cf-connecting-ip") ?? "unknown";
+  // Bucket IPv6 by /64: an attacker's standard allocation is a whole /64, so
+  // per-address buckets would make the lockout trivially bypassable.
+  if (ip.includes(":")) {
+    const [head, tail = ""] = ip.split("::");
+    const headGroups = head ? head.split(":") : [];
+    const tailGroups = tail ? tail.split(":") : [];
+    const zeros = Array(Math.max(0, 8 - headGroups.length - tailGroups.length)).fill("0");
+    const full = [...headGroups, ...zeros, ...tailGroups];
+    return `${full.slice(0, 4).join(":")}::/64`;
+  }
+  return ip;
 }
 
 async function isLockedOut(env: Env, ip: string): Promise<boolean> {
@@ -181,7 +200,7 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
     try {
       const form = await request.formData();
       passphrase = String(form.get("passphrase") ?? "");
-      reqInfo = JSON.parse(atob(String(form.get("req") ?? ""))) as AuthRequest;
+      reqInfo = JSON.parse(b64decodeUtf8(String(form.get("req") ?? ""))) as AuthRequest;
     } catch {
       return new Response("Invalid OAuth request", { status: 400 });
     }
