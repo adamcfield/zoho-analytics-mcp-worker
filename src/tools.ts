@@ -1629,6 +1629,11 @@ export function registerTools(
       annotations: { title: "Remove share", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
     async ({ workspace_id, email_ids, view_ids, remove_all_views, group_ids, dry_run }) => {
+      // An explicitly-empty list is rejected (not treated as "omitted") so it can
+      // never ride alongside removeAllViews as an ambiguous dual-key payload.
+      if (view_ids !== undefined && view_ids.length === 0) {
+        return fail("view_ids was an empty array — pass view ids, or omit it and set remove_all_views=true.");
+      }
       if (!view_ids?.length && !remove_all_views) return fail("Provide view_ids, or remove_all_views=true.");
       if (view_ids?.length && remove_all_views) {
         return fail("Pass either `view_ids` OR remove_all_views=true — not both (ambiguous: all-views would override the list).");
@@ -1638,7 +1643,7 @@ export function registerTools(
       return run(() =>
         client.removeShare(workspace_id, {
           emailIds: email_ids,
-          ...(view_ids ? { viewIds: view_ids } : {}),
+          ...(view_ids?.length ? { viewIds: view_ids } : {}),
           ...(remove_all_views ? { removeAllViews: true } : {}),
           ...(group_ids ? { groupIds: group_ids } : {}),
         }),

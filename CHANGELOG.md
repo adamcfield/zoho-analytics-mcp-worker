@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.5.1 — Sweep round 3 (2 confirmed findings fixed)
+
+Round 3 of the repetitive sweep came back nearly dry: 2 confirmed findings, both fixed.
+
+### Fixed
+- **Deploy workflow could never deploy:** deploy.yml pinned Node 20, but wrangler 4.x's CLI
+  hard-exits below Node 22 — every dispatched deploy failed at the deploy step while CI stayed
+  green (nothing in CI invokes wrangler). Both workflows now pin Node 22.
+- **`zoho_remove_share`:** an explicitly-empty `view_ids: []` bypassed the round-2 exclusivity
+  guard and was forwarded alongside `removeAllViews: true` as the exact ambiguous dual-key payload
+  the guard exists to prevent. Empty arrays are now rejected up front, and the spread only includes
+  non-empty lists.
+
 ## 1.5.0 — Sweep round 2 (18 confirmed findings fixed)
 
 Second sweep round: 18 confirmed (vs 29 in round 1 — converging), all fixed.

@@ -23,7 +23,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # wrangler 4.x hard-requires Node >= 22 (its bin exits 1 below that).
+          node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run typecheck
