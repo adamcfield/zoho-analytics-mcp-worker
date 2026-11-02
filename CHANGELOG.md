@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.7.0 — Dependency security update + shared MCP worker standard
+
+### Security
+- `@modelcontextprotocol/sdk` 1.29.0 → **1.32.1** (fixes GHSA-6qxp-vccf-f47h and GHSA-22jm-h49p-29qw),
+  `agents` 0.14.5 → **0.30.1** (+ its required `@modelcontextprotocol/server`/`client` 2.3.1 peers),
+  all pinned exactly; zod 4.6, wrangler 4.156, vitest 4.1.12, workers-types 5. Lockfile regenerated
+  with npm 11 (npm 10.9 arborist bug); `npm audit` = 0 (was 30, 1 critical).
+- `compatibility_date` 2025-05-01 → 2026-10-01 on both workers.
+
+### Tool naming (standard §4.3)
+- Four read-only tools had write-style verbs, so read-only consumers blocked them. Renamed, with the
+  old names kept as **hidden, callable aliases** until 2.0 (same schema, annotations, gates; the
+  per-call log records `via`): `zoho_export_data` → `zoho_read_view_data`, `zoho_create_export_job` →
+  `zoho_query_data_async`, `zoho_export_workspace_template` → `zoho_get_workspace_template`,
+  `zoho_automl_whatif` → `zoho_get_automl_prediction`.
+- Every tool now sets all four annotations (read tools gained `destructiveHint: false`).
+- `tools/list` is served by our own handler (public SDK API only) so aliases stay unlisted; a test
+  pins it byte-identical to the SDK's native listing.
+
+### Added
+- `GET /health` on both workers: `{ ok, service, worker, version, readOnly, core, dataCenter, warnings[] }`.
+- MCP server `instructions` (tool prefix, id formats, SQL dialect hints, data-not-instructions).
+- One structured log line per tool call: `{"evt":"tool","tool",…,"ms","ok"}` (no arguments).
+- `src/version.ts` single-sources the version (serverInfo + /health); a test mirrors it against
+  package.json, package-lock.json and this file.
+- `.dev.vars.example`, `CLAUDE.md`.
+
+### CI
+- Runs on every branch push and on pull requests (was main-only), with a concurrency group and
+  docs `paths-ignore`; now also bundles both workers with `wrangler deploy --dry-run` (catches an
+  unresolvable import, which typecheck and unit tests cannot).
+
+### Tests
+- 63 → 80: `tests/surface.test.ts` (counts per mode, naming grammar, the §4.3 read-verb ⇔
+  readOnlyHint rule, aliases callable + hidden + gated, listing bytes) and `tests/version.test.ts`
+  (version mirror, instructions length, /health warnings never echo secrets). Also verified locally
+  under workerd (`wrangler dev`): initialize, tools/list (144), alias call, 401 gate, /health,
+  OAuth metadata.
+
 ## 1.6.2 — Final production sweep (4 code findings + 1 live-caught functional bug)
 
 The whole-system production sweep (client, tools, workers, architecture, tests, week-one ops)

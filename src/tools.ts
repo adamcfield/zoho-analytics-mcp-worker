@@ -10,7 +10,10 @@
  * mutating tools never even appear in tools/list on reporting-only deploys.
  */
 
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer, RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { normalizeObjectSchema } from "@modelcontextprotocol/sdk/server/zod-compat.js";
+import { toJsonSchemaCompat } from "@modelcontextprotocol/sdk/server/zod-json-schema-compat.js";
 import { z } from "zod";
 import {
   ZohoAnalyticsClient,
@@ -169,7 +172,28 @@ export function capRows(rows: AnyRec[], max: number): { rows: AnyRec[]; truncate
 
 // Annotations: hints so a client knows which tools are safe to auto-run.
 // All tools call an external service, so openWorldHint is true throughout.
-const READ_ONLY = { readOnlyHint: true, idempotentHint: true, openWorldHint: true } as const;
+/**
+ * Closed read-verb vocabulary (MCP worker standard §4.3). A tool is read-only
+ * (readOnlyHint: true) IF AND ONLY IF its first token after `zoho_` is one of
+ * these — tests/surface.test.ts enforces it so read-only consumers (e.g. the
+ * Google Chat bot's filter) can trust name and annotation alike.
+ */
+export const READ_VERBS = ["get", "list", "search", "read", "query", "describe", "count", "find", "trace", "audit", "whoami", "health"] as const;
+
+/**
+ * Renamed tools: old name -> new name. Each old name stays CALLABLE as a hidden
+ * alias (same schema, annotations, gates and handler) but is never advertised in
+ * tools/list, so claude.ai connectors with cached schemas keep working. Remove in 2.0.
+ */
+export const RENAMES: Readonly<Record<string, string>> = {
+  zoho_export_data: "zoho_read_view_data",
+  zoho_create_export_job: "zoho_query_data_async",
+  zoho_export_workspace_template: "zoho_get_workspace_template",
+  zoho_automl_whatif: "zoho_get_automl_prediction",
+};
+export const ALIAS_REMOVAL_VERSION = "2.0.0";
+
+const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } as const;
 
 const TABLE_DATATYPES = [
   "PLAIN",
@@ -215,6 +239,45 @@ export interface RegisterToolsOptions {
   exportStore?: {
     save(body: string, contentType: string): Promise<{ url: string; expires_at: string }>;
   };
+  /**
+   * Hide the deprecated RENAMES aliases from tools/list (default true). Tests set
+   * false to compare the custom listing with the SDK's native one.
+   */
+  hideAliases?: boolean;
+}
+
+/** Empty-input JSON Schema, exactly as the SDK emits it. */
+const EMPTY_OBJECT_JSON_SCHEMA = { type: "object", properties: {} };
+
+/**
+ * Own `tools/list` so the deprecated aliases stay callable but unadvertised. This
+ * mirrors the SDK's handler field for field (same conversion helpers, same key
+ * order), and tests/surface.test.ts asserts the bytes match the native listing.
+ * Uses only public API: setRequestHandler replaces the handler the SDK installs
+ * lazily on the first registerTool, so call this AFTER every tool is registered.
+ */
+export function installListing(server: McpServer, listed: [string, RegisteredTool][]): void {
+  server.server.setRequestHandler(ListToolsRequestSchema, () => ({
+    tools: listed
+      .filter(([, tool]) => tool.enabled)
+      .map(([name, tool]) => {
+        const obj = normalizeObjectSchema(tool.inputSchema);
+        const def: Record<string, unknown> = {
+          name,
+          title: tool.title,
+          description: tool.description,
+          inputSchema: obj ? toJsonSchemaCompat(obj, { strictUnions: true, pipeStrategy: "input" }) : EMPTY_OBJECT_JSON_SCHEMA,
+          annotations: tool.annotations,
+          execution: tool.execution,
+          _meta: tool._meta,
+        };
+        if (tool.outputSchema) {
+          const out = normalizeObjectSchema(tool.outputSchema);
+          if (out) def.outputSchema = toJsonSchemaCompat(out, { strictUnions: true, pipeStrategy: "output" });
+        }
+        return def;
+      }),
+  }) as never);
 }
 
 /**
@@ -234,9 +297,9 @@ const CORE_TOOLS = new Set([
   "zoho_get_metadata",
   "zoho_describe_workspace",
   "zoho_list_folders",
-  "zoho_export_data",
+  "zoho_read_view_data",
   "zoho_query_data",
-  "zoho_create_export_job",
+  "zoho_query_data_async",
   "zoho_get_export_job",
   "zoho_get_import_job",
   "zoho_add_row",
@@ -261,19 +324,36 @@ export function registerTools(
   // Central registration gate: applies the MCP_CORE filter and wraps every
   // handler with the optional usage hook. Typed as the real method so handler
   // arg inference from the Zod inputSchema is preserved.
+  // Every canonical (advertised) tool, in registration order, for installListing.
+  const listed: [string, RegisteredTool][] = [];
+  const aliasesOf = (canonical: string) => Object.keys(RENAMES).filter((old) => RENAMES[old] === canonical);
   const instrument = (register: McpServer["registerTool"]): McpServer["registerTool"] =>
     ((name: string, cfg: unknown, handler: (...a: unknown[]) => Promise<ToolResult>) => {
       if (opts.core && !CORE_TOOLS.has(name)) return undefined;
-      const wrapped = async (...args: unknown[]): Promise<ToolResult> => {
+      const wrap = (calledAs: string) => async (...args: unknown[]): Promise<ToolResult> => {
+        const started = Date.now();
         const out = await handler(...args);
+        const ok = out?.isError !== true;
         try {
-          opts.track?.(name, out?.isError !== true);
+          opts.track?.(calledAs, ok);
+          // One structured line per call (standard §8.1): no arguments, no PII.
+          console.log(JSON.stringify({ evt: "tool", tool: name, ...(calledAs !== name ? { via: calledAs } : {}), ms: Date.now() - started, ok }));
         } catch {
           /* telemetry must never break a tool call */
         }
         return out;
       };
-      return register(name as never, cfg as never, wrapped as never);
+      const registered = register(name as never, cfg as never, wrap(name) as never) as unknown as RegisteredTool;
+      listed.push([name, registered]);
+      for (const old of aliasesOf(name)) {
+        const c = cfg as { description?: string };
+        register(
+          old as never,
+          { ...(cfg as object), description: `Deprecated alias of ${name} (removed in ${ALIAS_REMOVAL_VERSION}). ${c.description ?? ""}` } as never,
+          wrap(old) as never,
+        );
+      }
+      return registered;
     }) as McpServer["registerTool"];
 
   // Reads register through readTool; writes through writeTool — a no-op when the
@@ -500,10 +580,10 @@ export function registerTools(
   );
 
   readTool(
-    "zoho_export_data",
+    "zoho_read_view_data",
     {
       description:
-        "Export the rows of a table/view SYNCHRONOUSLY and return them as parsed rows (response_format=json, default) — the quick way to read a whole table or a filtered slice. Use `criteria` to filter and `selected_columns` to project. NOT allowed for views over 1,000,000 rows, live-connect workspaces, or Dashboard/Query-Table views — use zoho_query_data or zoho_create_export_job for those. NOTE: columns marked PII in Zoho are silently excluded from exports. Caps returned rows at max_rows.",
+        "Export the rows of a table/view SYNCHRONOUSLY and return them as parsed rows (response_format=json, default) — the quick way to read a whole table or a filtered slice. Use `criteria` to filter and `selected_columns` to project. NOT allowed for views over 1,000,000 rows, live-connect workspaces, or Dashboard/Query-Table views — use zoho_query_data or zoho_query_data_async for those. NOTE: columns marked PII in Zoho are silently excluded from exports. Caps returned rows at max_rows.",
       inputSchema: {
         workspace_id: z.string().describe("Workspace id."),
         view_id: z.string().describe("View/table id."),
@@ -604,7 +684,7 @@ export function registerTools(
   );
 
   readTool(
-    "zoho_create_export_job",
+    "zoho_query_data_async",
     {
       description:
         "Start an ASYNCHRONOUS export job (for large exports you don't want to block on) and return its job_id. Provide EITHER sql_query (export the query result) OR view_id (export a whole view). Then poll zoho_get_export_job(job_id, download=true) to fetch the data once it's ready. Defaults to CSV (best for large/raw exports).",
@@ -616,7 +696,7 @@ export function registerTools(
         criteria: z.string().optional().describe("Optional filter when exporting a view_id."),
         options: advOpt,
       },
-      annotations: { title: "Create export job (async)", readOnlyHint: true, idempotentHint: false, openWorldHint: true },
+      annotations: { title: "Query data (async export job)", readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async ({ workspace_id, sql_query, view_id, response_format, criteria, options }) =>
       run(async () => {
@@ -641,7 +721,7 @@ export function registerTools(
         "Check an asynchronous export job's status (jobCode 1001/1002 = running, 1003 = FAILED server-side, 1004 = done, 1005 = invalid). Set download=true to also fetch the data once the job is complete — returns parsed rows for json exports or raw text for csv.",
       inputSchema: {
         workspace_id: z.string().describe("Workspace id."),
-        job_id: z.string().describe("Export job id from zoho_create_export_job / zoho_query_data."),
+        job_id: z.string().describe("Export job id from zoho_query_data_async / zoho_query_data."),
         download: z.boolean().optional().describe("If the job is complete, also download and return its data."),
         max_rows: z.number().int().min(1).max(100000).optional().describe("Max rows to return when downloading json (default 1000)."),
       },
@@ -2086,7 +2166,7 @@ export function registerTools(
     {
       description: "Get a shareable open-view URL for a view. Use options for title/toolbar/legend display flags.",
       inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), options: advOpt },
-      annotations: { title: "Get view URL", readOnlyHint: true, idempotentHint: false, openWorldHint: true },
+      annotations: { title: "Get view URL", readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async ({ workspace_id, view_id, options }) => run(() => client.getViewUrl(workspace_id, view_id, options)),
   );
@@ -2096,7 +2176,7 @@ export function registerTools(
     {
       description: "Get an embed URL for a view (embedded-analytics). Use options for validityPeriod/permissions/criteria.",
       inputSchema: { workspace_id: ID("Workspace id."), view_id: ID("View id."), options: advOpt },
-      annotations: { title: "Get embed URL", readOnlyHint: true, idempotentHint: false, openWorldHint: true },
+      annotations: { title: "Get embed URL", readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async ({ workspace_id, view_id, options }) => run(() => client.getEmbedUrl(workspace_id, view_id, options)),
   );
@@ -2260,7 +2340,7 @@ export function registerTools(
     {
       description: "Get the shareable URL for a slideshow. Use options for autoplay/slideInterval/title flags.",
       inputSchema: { workspace_id: ID("Workspace id."), slide_id: ID("Slideshow id."), options: advOpt },
-      annotations: { title: "Get slideshow URL", readOnlyHint: true, idempotentHint: false, openWorldHint: true },
+      annotations: { title: "Get slideshow URL", readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async ({ workspace_id, slide_id, options }) => run(() => client.getSlideshowUrl(workspace_id, slide_id, options)),
   );
@@ -2395,7 +2475,7 @@ export function registerTools(
   );
 
   readTool(
-    "zoho_export_workspace_template",
+    "zoho_get_workspace_template",
     {
       description:
         "Export selected views as a reusable workspace-template ZIP, returned BASE64-encoded (decode and save as .zip). Useful for cloning a workspace structure.",
@@ -2922,7 +3002,7 @@ export function registerTools(
   );
 
   readTool(
-    "zoho_automl_whatif",
+    "zoho_get_automl_prediction",
     {
       description: "What-if analysis: feed a model one set of feature values and get its prediction. features = { columnName: value, ... }.",
       inputSchema: {
@@ -2931,11 +3011,14 @@ export function registerTools(
         model_id: ID("Model id."),
         features: z.record(z.string(), cellValue).describe("Feature inputs, e.g. { \"Age\": 42, \"Region\": \"East\" }."),
       },
-      annotations: { title: "AutoML what-if", readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+      annotations: { title: "AutoML what-if prediction", ...READ_ONLY },
     },
     async ({ workspace_id, analysis_id, model_id, features }) =>
       run(() => client.autoMLWhatIf(workspace_id, analysis_id, model_id, { features })),
   );
+
+  // Advertise canonical tools only; RENAMES aliases stay registered (callable).
+  if (opts.hideAliases !== false && listed.length > 0) installListing(server, listed);
 }
 
 /**

@@ -7,6 +7,7 @@
  *
  * Endpoints:
  *   GET  /            -> public health check (no auth)
+ *   GET  /health      -> JSON health { ok, version, warnings[] } (no auth)
  *   POST /mcp         -> MCP Streamable HTTP   (bearer required)
  *   GET  /sse         -> MCP SSE (legacy)      (bearer required)
  *
@@ -28,6 +29,8 @@
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ZohoAnalyticsClient, kvTokenStore, signDownloadToken, verifyDownloadToken, constantTimeEqual } from "./zohoanalytics.js";
+import { VERSION, MCP_INSTRUCTIONS } from "./version.js";
+import { healthBody, healthResponse } from "./health.js";
 import { registerTools, registerResourcesAndPrompts, type RegisterToolsOptions } from "./tools.js";
 
 /** Workers Rate Limiting binding (open beta) — structural type. */
@@ -125,7 +128,7 @@ export function integrationsFromEnv(env: Env): Pick<RegisterToolsOptions, "track
 }
 
 export class ZohoAnalyticsMCP extends McpAgent<Env> {
-  server = new McpServer({ name: "zoho-analytics", version: "1.6.2" });
+  server = new McpServer({ name: "zoho-analytics", version: VERSION }, { instructions: MCP_INSTRUCTIONS });
 
   async init(): Promise<void> {
     const client = clientFromEnv(this.env);
@@ -174,6 +177,11 @@ export default {
         status: 200,
         headers: { "content-type": "text/plain" },
       });
+    }
+
+    // Structured health (no auth, no secret values): { ok, version, warnings[] }.
+    if (request.method === "GET" && url.pathname === "/health") {
+      return healthResponse(healthBody(env, "bearer", env.MCP_AUTH_TOKEN ? [] : ["MCP_AUTH_TOKEN not set (every MCP call returns 401)"]));
     }
 
     // Signed export downloads (capability URL — the HMAC in the query IS the auth).

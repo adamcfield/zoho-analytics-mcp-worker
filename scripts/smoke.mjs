@@ -57,9 +57,9 @@ const READ_TOOLS = [
   "zoho_list_views",
   "zoho_describe_workspace",
   "zoho_get_view_details",
-  "zoho_export_data",
+  "zoho_read_view_data",
   "zoho_query_data",
-  "zoho_create_export_job",
+  "zoho_query_data_async",
   "zoho_get_export_job",
   "zoho_list_users",
   "zoho_get_view_url",
@@ -99,7 +99,7 @@ if (readonly) console.log("note: read-only deployment detected — skipping writ
 const minTools = core ? (readonly ? 12 : 20) : readonly ? 40 : 130;
 check("tools/list", tools.length >= minTools, `(${tools.length} tools)`);
 // Read tools present in EVERY mode (core, readonly, and both).
-const ALWAYS_READS = ["zoho_whoami", "zoho_list_workspaces", "zoho_describe_workspace", "zoho_query_data", "zoho_export_data"];
+const ALWAYS_READS = ["zoho_whoami", "zoho_list_workspaces", "zoho_describe_workspace", "zoho_query_data", "zoho_read_view_data"];
 for (const t of core ? ALWAYS_READS : READ_TOOLS) check(`tool present: ${t}`, has(t));
 if (!readonly) for (const t of (core ? ["zoho_add_row", "zoho_import_data", "zoho_create_table"] : WRITE_TOOLS)) check(`tool present: ${t}`, has(t));
 
