@@ -60,7 +60,7 @@ const READ_TOOLS = [
   "zoho_read_view_data",
   "zoho_query_data",
   "zoho_query_data_async",
-  "zoho_get_export_job",
+  "zoho_get_query_job",
   "zoho_list_users",
   "zoho_get_view_url",
 ];

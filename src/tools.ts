@@ -190,6 +190,7 @@ export const RENAMES: Readonly<Record<string, string>> = {
   zoho_create_export_job: "zoho_query_data_async",
   zoho_export_workspace_template: "zoho_get_workspace_template",
   zoho_automl_whatif: "zoho_get_automl_prediction",
+  zoho_get_export_job: "zoho_get_query_job",
 };
 export const ALIAS_REMOVAL_VERSION = "2.0.0";
 
@@ -300,7 +301,7 @@ const CORE_TOOLS = new Set([
   "zoho_read_view_data",
   "zoho_query_data",
   "zoho_query_data_async",
-  "zoho_get_export_job",
+  "zoho_get_query_job",
   "zoho_get_import_job",
   "zoho_add_row",
   "zoho_update_rows",
@@ -622,7 +623,7 @@ export function registerTools(
     "zoho_query_data",
     {
       description:
-        "Run an ad-hoc SQL SELECT against a workspace and return the result rows. This is the headline analytics tool. Under the hood it creates an async bulk export job from your SQL, polls it to completion, downloads the result, and parses it. ZOHO SQL DIALECT RULES: double-quote ALL table/column names; aggregates (COUNT/SUM/MIN/MAX/AVG) are NOT allowed inside ORDER BY / GROUP BY / WHERE — alias the aggregate in SELECT and order by the alias (SELECT \"Region\", COUNT(*) AS \"N\" FROM \"Orders\" GROUP BY \"Region\" ORDER BY \"N\" DESC); every non-aggregated SELECT column must appear in GROUP BY. NOTE: columns marked PII in Zoho are silently EXCLUDED from exported rows (aggregating on them still works). Jobs routinely take 30-90s; if the wait window is exceeded you get a job_id to continue via zoho_get_export_job. Caps returned rows at max_rows.",
+        "Run an ad-hoc SQL SELECT against a workspace and return the result rows. This is the headline analytics tool. Under the hood it creates an async bulk export job from your SQL, polls it to completion, downloads the result, and parses it. ZOHO SQL DIALECT RULES: double-quote ALL table/column names; aggregates (COUNT/SUM/MIN/MAX/AVG) are NOT allowed inside ORDER BY / GROUP BY / WHERE — alias the aggregate in SELECT and order by the alias (SELECT \"Region\", COUNT(*) AS \"N\" FROM \"Orders\" GROUP BY \"Region\" ORDER BY \"N\" DESC); every non-aggregated SELECT column must appear in GROUP BY. NOTE: columns marked PII in Zoho are silently EXCLUDED from exported rows (aggregating on them still works). Jobs routinely take 30-90s; if the wait window is exceeded you get a job_id to continue via zoho_get_query_job. Caps returned rows at max_rows.",
       inputSchema: {
         workspace_id: z.string().describe("Workspace id to run the query against."),
         sql_query: z.string().describe('SQL SELECT. Quote identifiers: SELECT "col" FROM "Table" WHERE ...'),
@@ -651,7 +652,7 @@ export function registerTools(
               job_id: jobId,
               done: false,
               job_code: code,
-              note: "Query still running. Poll zoho_get_export_job with download=true to fetch results when ready.",
+              note: "Query still running. Poll zoho_get_query_job with download=true to fetch results when ready.",
             };
           }
           await sleep(interval);
@@ -687,7 +688,7 @@ export function registerTools(
     "zoho_query_data_async",
     {
       description:
-        "Start an ASYNCHRONOUS export job (for large exports you don't want to block on) and return its job_id. Provide EITHER sql_query (export the query result) OR view_id (export a whole view). Then poll zoho_get_export_job(job_id, download=true) to fetch the data once it's ready. Defaults to CSV (best for large/raw exports).",
+        "Start an ASYNCHRONOUS export job (for large exports you don't want to block on) and return its job_id. Provide EITHER sql_query (export the query result) OR view_id (export a whole view). Then poll zoho_get_query_job(job_id, download=true) to fetch the data once it's ready. Defaults to CSV (best for large/raw exports).",
       inputSchema: {
         workspace_id: z.string().describe("Workspace id."),
         sql_query: z.string().optional().describe("SQL SELECT to export (alternative to view_id)."),
@@ -715,7 +716,7 @@ export function registerTools(
   );
 
   readTool(
-    "zoho_get_export_job",
+    "zoho_get_query_job",
     {
       description:
         "Check an asynchronous export job's status (jobCode 1001/1002 = running, 1003 = FAILED server-side, 1004 = done, 1005 = invalid). Set download=true to also fetch the data once the job is complete — returns parsed rows for json exports or raw text for csv.",

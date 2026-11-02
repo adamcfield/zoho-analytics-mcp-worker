@@ -115,6 +115,7 @@ All tools call an external service (`openWorldHint: true`). IDs (`workspace_id`,
 | `zoho_create_export_job` | `zoho_query_data_async` |
 | `zoho_export_workspace_template` | `zoho_get_workspace_template` |
 | `zoho_automl_whatif` | `zoho_get_automl_prediction` |
+| `zoho_get_export_job` | `zoho_get_query_job` |
 
 ### Discovery & metadata (read-only)
 
@@ -136,10 +137,10 @@ All tools call an external service (`openWorldHint: true`). IDs (`workspace_id`,
 | `zoho_query_data` | **The headline tool** — run an ad-hoc SQL `SELECT`. Creates an async bulk export job from your SQL, polls it to completion, downloads & parses the rows | `workspace_id`, `sql_query`, `max_rows?`, `timeout_seconds?` | read-only |
 | `zoho_read_view_data` | Synchronously export a table/view's rows (optionally filtered/projected) as parsed rows | `workspace_id`, `view_id`, `criteria?`, `selected_columns?`, `response_format?`, `max_rows?` | read-only |
 | `zoho_query_data_async` | Start an **async** export (by SQL or by view) for large results; returns a `job_id` | `workspace_id`, `sql_query?`/`view_id?`, `response_format?`, `criteria?` | read-only · not idempotent |
-| `zoho_get_export_job` | Check an export job (`1001`/`1002` running · `1003` **failed** · `1004` done · `1005` invalid) and optionally download its data | `workspace_id`, `job_id`, `download?`, `max_rows?` | read-only |
+| `zoho_get_query_job` | Check an export job (`1001`/`1002` running · `1003` **failed** · `1004` done · `1005` invalid) and optionally download its data | `workspace_id`, `job_id`, `download?`, `max_rows?` | read-only |
 | `zoho_get_import_job` | Check an import job's status + summary | `workspace_id`, `job_id` | read-only |
 
-> **Sync vs. async export.** `zoho_read_view_data` is synchronous and convenient, but Zoho disallows it for views over 1,000,000 rows, live-connect workspaces, and Dashboard/Query-Table views. For those — and for ad-hoc SQL — use `zoho_query_data` (waits inline) or `zoho_query_data_async` + `zoho_get_export_job` (for results too big to wait on).
+> **Sync vs. async export.** `zoho_read_view_data` is synchronous and convenient, but Zoho disallows it for views over 1,000,000 rows, live-connect workspaces, and Dashboard/Query-Table views. For those — and for ad-hoc SQL — use `zoho_query_data` (waits inline) or `zoho_query_data_async` + `zoho_get_query_job` (for results too big to wait on).
 
 ### Writes (gated by `MCP_READONLY`)
 
@@ -219,7 +220,7 @@ The tools map onto these Zoho Analytics v2 endpoints (relative to `https://<api-
 | `zoho_delete_rows` | `DELETE /workspaces/{workspace-id}/views/{view-id}/rows` |
 | `zoho_query_data` / `zoho_query_data_async` (SQL) | `GET /bulk/workspaces/{workspace-id}/data` (`sqlQuery`) |
 | `zoho_query_data_async` (view) | `GET /bulk/workspaces/{workspace-id}/views/{view-id}/data` |
-| `zoho_get_export_job` | `GET /bulk/workspaces/{workspace-id}/exportjobs/{job-id}` (+ `/data` to download) |
+| `zoho_get_query_job` | `GET /bulk/workspaces/{workspace-id}/exportjobs/{job-id}` (+ `/data` to download) |
 | `zoho_import_data` | `POST /bulk/workspaces/{workspace-id}/views/{view-id}/data` (multipart `FILE`) |
 | `zoho_get_import_job` | `GET /bulk/workspaces/{workspace-id}/importjobs/{job-id}` |
 | `zoho_create_workspace` | `POST /workspaces` |
@@ -429,7 +430,7 @@ npx wrangler deploy -c wrangler.oauth.jsonc
 ## Caveats
 
 - **Bring your own OAuth app.** You need a registered Zoho client and a refresh token (see [Getting Zoho OAuth credentials](#getting-zoho-oauth-credentials)). `ZOHO_DC` must match the data center your account lives in, or token refresh fails.
-- **Ad-hoc SQL is async.** Zoho runs ad-hoc SQL through a bulk export *job*. `zoho_query_data` hides this (create → poll → download) but bounds its wait (default 50s, cap 120s; Zoho jobs routinely take 30–90s); for very large result sets it returns a `job_id` to poll with `zoho_get_export_job`.
+- **Ad-hoc SQL is async.** Zoho runs ad-hoc SQL through a bulk export *job*. `zoho_query_data` hides this (create → poll → download) but bounds its wait (default 50s, cap 120s; Zoho jobs routinely take 30–90s); for very large result sets it returns a `job_id` to poll with `zoho_get_query_job`.
 - **API units & frequency limits.** Calls consume daily API units and are subject to per-minute frequency limits (≈100 req/min overall). Batch tools use bounded concurrency, but heavy use can still hit quota errors (`6043`/`6044`/`6045`).
 - **Large tool surface.** Full coverage means ~144 tools. That's a lot for one connector — if your client struggles with the count or you only need reporting, deploy with `MCP_READONLY=true` for the ~51 read tools. Advanced/long-tail CONFIG keys on the modeling, sharing, publish, and variable tools are passed through an `options` object (documented per tool) rather than enumerated as parameters.
 - **OAuth worker: single-user by default, multi-user opt-in.** Out of the box the OAuth worker gates on one shared passphrase and acts with one worker-wide Zoho token — fine for a personal connector. Set `ZOHO_MULTI_USER=true` (with a *server-based* Zoho client whose redirect URI is `<origin>/zoho/callback`) to make the consent screen a real per-user Zoho login: each user's own refresh token is held in the encrypted OAuth grant, access-token and schema caches are namespaced per user, and the server acts as — and is rate-limited per — that user. Multi-user mode ships off and, while it has its own end-to-end consent + isolation tests, has not been exercised against a live multi-tenant org — validate it before relying on it.

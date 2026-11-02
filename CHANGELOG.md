@@ -14,7 +14,9 @@
   old names kept as **hidden, callable aliases** until 2.0 (same schema, annotations, gates; the
   per-call log records `via`): `zoho_export_data` → `zoho_read_view_data`, `zoho_create_export_job` →
   `zoho_query_data_async`, `zoho_export_workspace_template` → `zoho_get_workspace_template`,
-  `zoho_automl_whatif` → `zoho_get_automl_prediction`.
+  `zoho_automl_whatif` → `zoho_get_automl_prediction`, and `zoho_get_export_job` → `zoho_get_query_job`
+  (read verb already, but "export" anywhere in a name trips read-only filters, which left
+  `zoho_query_data_async` jobs unreadable).
 - Every tool now sets all four annotations (read tools gained `destructiveHint: false`).
 - `tools/list` is served by our own handler (public SDK API only) so aliases stay unlisted; a test
   pins it byte-identical to the SDK's native listing.
