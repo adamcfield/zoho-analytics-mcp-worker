@@ -4,7 +4,8 @@ import { readFileSync } from "node:fs";
 import { VERSION, MCP_INSTRUCTIONS } from "../src/version.js";
 import { healthBody } from "../src/health.js";
 
-const read = (p: string) => readFileSync(new URL(`../${p}`, import.meta.url), "utf8");
+// vitest runs from the repo root.
+const read = (p: string) => readFileSync(p, "utf8");
 
 describe("version", () => {
   it("matches package.json and package-lock.json", () => {
