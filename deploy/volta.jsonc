@@ -12,7 +12,7 @@
   // a CLOUDFLARE_ACCOUNT_ID that disagrees is refused.
   "account_id": "bc6ba47b42d6c9cd4fed775da4baac90",
   // The account's workers.dev subdomain (<worker>.<this>.workers.dev). Fills {subdomain} in vars.
-  "workers_dev_subdomain": "",
+  "workers_dev_subdomain": "volta-solar",
   "configs": {
     "wrangler.jsonc": {
       "workers_dev": true,
