@@ -4,8 +4,11 @@ name: Deploy
 # in this repo, to the personal Cloudflare account. CLOUDFLARE_API_TOKEN is one repo secret
 # that sees several accounts, so the account id is pinned here (an account id is not a secret).
 # Worker secrets live on Cloudflare and are untouched by a deploy.
-# Manual trigger only for now; a push-to-main trigger is added once auto-deploy is approved.
+# Auto-deploys every push to main (Adam, 2026-11-02); manual dispatch can redeploy one worker.
 on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'LICENSE', 'docs/**']
   workflow_dispatch:
     inputs:
       target:
