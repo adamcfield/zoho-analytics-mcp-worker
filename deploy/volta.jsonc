@@ -5,14 +5,10 @@
 // the create commands). KV ids are identifiers, not secrets. Crons stay OFF on the copy while
 // both deployments run, so scheduled side effects don't happen twice.
 {
+  // Volta Cloudflare account ("Adam@volta.solar's Account"). Overrides the personal account_id
+  // pinned in the base configs.
+  "account_id": "bc6ba47b42d6c9cd4fed775da4baac90",
   "configs": {
-    "wrangler.jsonc": {
-      "domain": "zoho.mcp.volta.solar",
-      "kv": { "TOKEN_KV": "" },
-      "vars": { "PUBLIC_BASE_URL": "https://zoho.mcp.volta.solar" }
-    },
-    // Its own OAUTH_KV. On the personal account this namespace is shared with
-    // github-mcp-worker; never copy it.
-    "wrangler.oauth.jsonc": { "domain": "zoho-oauth.mcp.volta.solar", "kv": { "OAUTH_KV": "" } }
+    "wrangler.jsonc": { "domain": "govmap.mcp.volta.solar", "kv": { "GOVMAP_KV": "" }, "crons": [] }
   }
 }

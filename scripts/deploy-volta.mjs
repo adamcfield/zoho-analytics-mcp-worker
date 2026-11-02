@@ -13,9 +13,10 @@
  *   node scripts/deploy-volta.mjs --check    exit 0 = ready, 3 = overlay not filled in yet
  *   node scripts/deploy-volta.mjs --plan     print the `wrangler kv namespace create` commands
  *
- * Credentials come from the environment (CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID for the
- * Volta account). Any `account_id` in the base config is dropped so the copy can never land on
- * the personal account by accident.
+ * The Volta account id is pinned in the overlay and overrides any `account_id` in the base
+ * config, so the copy can never land on the personal account. Auth is whatever wrangler has
+ * (an OAuth login that sees both accounts, or CLOUDFLARE_API_TOKEN in CI); a
+ * CLOUDFLARE_ACCOUNT_ID that disagrees with the overlay is refused.
  *
  * Refuses to deploy when a KV/D1/R2 binding has no Volta value: binding a personal-account id
  * on another account fails at best, and a typo silently creates an empty namespace at worst.
@@ -58,10 +59,13 @@ export const parseJsonc = (text) => JSON.parse(stripJsonc(text));
  * Merge one base config with its Volta overlay entry. Returns { config, missing }.
  * `missing` lists every value still to be filled in; a non-empty list means "do not deploy".
  */
-export function voltaConfig(base, overlay) {
+export function voltaConfig(base, overlay, accountId) {
   const config = structuredClone(base);
   const missing = [];
-  delete config.account_id;
+  // Pin the Volta account explicitly: one wrangler login can see several accounts, and the base
+  // config may pin the personal one.
+  if (!/^[0-9a-f]{32}$/.test(String(accountId ?? ""))) missing.push("account_id");
+  else config.account_id = accountId;
   delete config.env;
   delete config.route;
 
@@ -105,7 +109,7 @@ function main(argv) {
   const built = entries.map(([file, entry]) => {
     const basePath = join(root, file);
     const base = parseJsonc(readFileSync(basePath, "utf8"));
-    return { file, basePath, base, entry, ...voltaConfig(base, entry) };
+    return { file, basePath, base, entry, ...voltaConfig(base, entry, overlay.account_id) };
   });
 
   if (mode === "plan") {
@@ -131,8 +135,11 @@ function main(argv) {
     return NOT_READY;
   }
   if (mode === "check") { console.log("Volta overlay complete"); return 0; }
-  if (mode === "deploy" && !(process.env.CLOUDFLARE_API_TOKEN && process.env.CLOUDFLARE_ACCOUNT_ID)) {
-    throw new Error("CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID (Volta account) must be set");
+  // CLOUDFLARE_ACCOUNT_ID beats the config's account_id in wrangler, so a mismatch would deploy
+  // the copy somewhere else. Refuse it.
+  const envAccount = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
+  if (envAccount && envAccount !== overlay.account_id) {
+    throw new Error(`CLOUDFLARE_ACCOUNT_ID (${envAccount}) is not the Volta account in deploy/volta.jsonc (${overlay.account_id})`);
   }
 
   for (const b of built) {
