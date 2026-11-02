@@ -1,0 +1,56 @@
+# Deploys the parallel copy of this worker to the Volta Cloudflare account.
+#
+# The personal deployment is untouched: this job only ever uses the VOLTA_* secrets, and
+# scripts/deploy-volta.mjs drops any account_id from the base config.
+#
+# Skips (green) until both are true:
+#   - repo secrets VOLTA_CLOUDFLARE_API_TOKEN and VOLTA_CLOUDFLARE_ACCOUNT_ID are set
+#   - deploy/volta.jsonc has every Volta KV id and domain filled in
+# Worker secrets on the Volta copy are set once with `wrangler secret put` from the owner's
+# machine; this workflow never touches them.
+name: Deploy (Volta copy)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-volta
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.VOLTA_CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.VOLTA_CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ready?
+        id: gate
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::notice::VOLTA_CLOUDFLARE_* secrets not set; skipping the Volta deploy"
+            echo "ready=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          set +e; node scripts/deploy-volta.mjs --check; rc=$?; set -e
+          if [ "$rc" = 0 ]; then echo "ready=true" >> "$GITHUB_OUTPUT";
+          elif [ "$rc" = 3 ]; then echo "ready=false" >> "$GITHUB_OUTPUT";
+          else exit "$rc"; fi
+      - if: steps.gate.outputs.ready == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ./package-lock.json
+      - if: steps.gate.outputs.ready == 'true'
+        run: npm ci
+      - if: steps.gate.outputs.ready == 'true'
+        run: node scripts/deploy-volta.mjs
