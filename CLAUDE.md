@@ -13,6 +13,9 @@ Workers, 144 tools (51 read). Two deployments from one codebase:
   `@cloudflare/workers-oauth-provider` for claude.ai. Single-user passphrase consent
   (`APP_PASSPHRASE`) by default; `ZOHO_MULTI_USER=true` = per-user Zoho login, refresh token
   in encrypted grant props. Uses `OAUTH_KV` for grants, token cache and schema cache.
+  Bring-your-own client (`src/byo.ts`, on unless `MCP_BYO_KEYS="false"`): grant props
+  `{zohoRefreshToken, cid, cs, dc, org}`; such a grant never uses the operator's `ZOHO_*`
+  client, org, DC or base URLs.
 
 ## Layout
 - `src/zohoanalytics.ts` — `ZohoAnalyticsClient`: DC routing (`DC_DOMAINS`), refresh-token
