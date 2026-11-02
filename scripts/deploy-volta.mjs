@@ -69,9 +69,11 @@ export function voltaConfig(base, overlay, accountId) {
   delete config.env;
   delete config.route;
 
-  if (!overlay.domain) missing.push("domain");
-  config.routes = overlay.domain ? [{ pattern: overlay.domain, custom_domain: true }] : [];
+  // A custom domain, or explicitly the account's workers.dev subdomain (fallback when the zone
+  // is not on the Volta account). One of the two, so the copy is never deployed unreachable.
   config.workers_dev = overlay.workers_dev ?? false;
+  if (!overlay.domain && !config.workers_dev) missing.push("domain (or workers_dev: true)");
+  config.routes = overlay.domain ? [{ pattern: overlay.domain, custom_domain: true }] : [];
 
   for (const ns of config.kv_namespaces ?? []) {
     const id = String(overlay.kv?.[ns.binding] ?? "").trim();
@@ -145,7 +147,7 @@ function main(argv) {
   for (const b of built) {
     const out = outPath(b.basePath);
     writeFileSync(out, JSON.stringify(b.config, null, 2) + "\n");
-    console.log(`${b.file} -> ${basename(out)}: ${b.config.name} on ${b.entry.domain}; crons ${JSON.stringify(b.config.triggers?.crons ?? [])}`);
+    console.log(`${b.file} -> ${basename(out)}: ${b.config.name} on ${b.entry.domain ?? "workers.dev"}; crons ${JSON.stringify(b.config.triggers?.crons ?? [])}`);
     const args = ["wrangler", "deploy", "-c", out, ...(mode === "dry-run" ? ["--dry-run", "--outdir", join(root, ".volta-dist", b.config.name)] : [])];
     const r = spawnSync("npx", args, { stdio: "inherit", cwd: root, env: { ...process.env, WRANGLER_SEND_METRICS: "false" } });
     if (r.status !== 0) return r.status ?? 1;
