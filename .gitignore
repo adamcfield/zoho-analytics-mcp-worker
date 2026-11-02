@@ -16,3 +16,6 @@ npm-debug.log*
 # OS / editor cruft
 .DS_Store
 .mcp-auth-token.local
+
+# Template for local secrets (copy to .dev.vars)
+!.dev.vars.example

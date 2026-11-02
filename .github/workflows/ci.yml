@@ -2,8 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    paths-ignore: ["**.md", "LICENSE", ".dev.vars.example"]
   pull_request:
+    paths-ignore: ["**.md", "LICENSE", ".dev.vars.example"]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -20,3 +25,7 @@ jobs:
       - run: npm test
       - run: node --check scripts/smoke.mjs
       - run: node --check scripts/live-test.mjs
+      # Bundle both workers: catches unresolvable imports (e.g. a missing
+      # `agents` peer) that typecheck and unit tests cannot see.
+      - run: npx wrangler deploy --dry-run --outdir dist/bearer
+      - run: npx wrangler deploy --dry-run -c wrangler.oauth.jsonc --outdir dist/oauth

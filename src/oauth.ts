@@ -15,6 +15,7 @@
  *
  * Routes:
  *   GET  /                         health check (no auth)
+ *   GET  /health                   JSON health { ok, version, warnings[] } (no auth)
  *   GET/POST /authorize            consent screen (passphrase or Zoho-login)
  *   GET  /zoho/callback            multi-user: Zoho redirect back (this file)
  *   /token, /register, /.well-known/oauth-*   handled by OAuthProvider
@@ -35,6 +36,8 @@ import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ZohoAnalyticsClient, kvTokenStore, DC_DOMAINS, constantTimeEqual } from "./zohoanalytics.js";
+import { VERSION, MCP_INSTRUCTIONS } from "./version.js";
+import { healthBody, healthResponse } from "./health.js";
 import { registerTools, registerResourcesAndPrompts } from "./tools.js";
 
 // Reuses the bearer worker's global Cloudflare.Env (MCP_OBJECT, ZOHO_*, etc.)
@@ -61,7 +64,7 @@ type AuthRequest = Awaited<ReturnType<OAuthHelpers["parseAuthRequest"]>>;
 
 /** The MCP agent — identical tool surface to the bearer worker. */
 export class ZohoAnalyticsMCP extends McpAgent<Env, unknown, Props> {
-  server = new McpServer({ name: "zoho-analytics", version: "1.6.2" });
+  server = new McpServer({ name: "zoho-analytics", version: VERSION }, { instructions: MCP_INSTRUCTIONS });
 
   async init(): Promise<void> {
     // Multi-user grants carry the user's own refresh token in (encrypted) props;
@@ -394,6 +397,11 @@ const defaultHandler = {
     const url = new URL(request.url);
     if (url.pathname === "/authorize") return handleAuthorize(request, env);
     if (url.pathname === "/zoho/callback" && multiUserEnabled(env)) return handleZohoCallback(request, env);
+    if (url.pathname === "/health" && request.method === "GET") {
+      const multi = multiUserEnabled(env);
+      const extra = !multi && !env.APP_PASSPHRASE ? ["APP_PASSPHRASE not set (single-user consent cannot complete)"] : [];
+      return healthResponse(healthBody(env, "oauth", extra, { perUserZoho: multi }));
+    }
     if (url.pathname === "/" && request.method === "GET") {
       return new Response("zoho-analytics-mcp-oauth worker: ok (OAuth-gated MCP at /mcp)", {
         status: 200,

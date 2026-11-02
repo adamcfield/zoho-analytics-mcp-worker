@@ -1,0 +1,20 @@
+# Copy to .dev.vars for `npm run dev` (wrangler dev). Never commit .dev.vars.
+# Production values are Worker secrets: wrangler secret put <NAME> [-c wrangler.oauth.jsonc]
+
+# Zoho OAuth app (api-console.zoho.com) + long-lived refresh token (access_type=offline)
+ZOHO_CLIENT_ID=
+ZOHO_CLIENT_SECRET=
+ZOHO_REFRESH_TOKEN=
+# ZANALYTICS-ORGID (zoho_get_orgs lists it) and data center: com|eu|in|au|jp|sa|ca|uk|cn
+ZOHO_ORG_ID=
+ZOHO_DC=com
+
+# Bearer worker: clients send Authorization: Bearer <MCP_AUTH_TOKEN>
+MCP_AUTH_TOKEN=
+
+# OAuth worker (single-user mode): consent-screen passphrase
+APP_PASSPHRASE=
+
+# Optional surface flags (exactly "true" enables)
+# MCP_READONLY=true
+# MCP_CORE=true

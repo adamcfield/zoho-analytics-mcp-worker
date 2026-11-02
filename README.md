@@ -67,6 +67,7 @@ Bearer worker (`zoho-analytics-mcp`):
 | Method | Path           | Auth   | Purpose                                  |
 |--------|----------------|--------|------------------------------------------|
 | `GET`  | `/`            | none   | Health check → `zoho-analytics-mcp worker: ok` |
+| `GET`  | `/health`      | none   | JSON health → `{ ok, version, warnings[] }` (non-empty `warnings` = misconfigured; never echoes secret values) |
 | `POST` | `/mcp`         | Bearer | MCP Streamable HTTP (modern clients)     |
 | `GET`  | `/sse`         | Bearer | MCP SSE (legacy clients)                 |
 
@@ -104,6 +105,18 @@ Two layers, kept separate:
 
 All tools call an external service (`openWorldHint: true`). IDs (`workspace_id`, `view_id`) come from the discovery tools. Filters use Zoho's `criteria` syntax — fully-qualified, double-quoted identifiers with single-quoted values, e.g. `"Sales"."Region"='East'`.
 
+**Naming contract.** Every tool is `zoho_<verb>_<noun>`, and `readOnlyHint: true` holds **exactly** when the verb is a read verb (`get`, `list`, `search`, `read`, `query`, `describe`, `count`, `find`, `trace`, `audit`, `whoami`, `health`) — `tests/surface.test.ts` enforces it, so read-only consumers can trust either signal. All four annotations are set on every tool.
+
+**Renamed in 1.7.0** (old names stay callable as hidden aliases until 2.0, so connectors with cached schemas keep working):
+
+| Old name | New name |
+|----------|----------|
+| `zoho_export_data` | `zoho_read_view_data` |
+| `zoho_create_export_job` | `zoho_query_data_async` |
+| `zoho_export_workspace_template` | `zoho_get_workspace_template` |
+| `zoho_automl_whatif` | `zoho_get_automl_prediction` |
+| `zoho_get_export_job` | `zoho_get_query_job` |
+
 ### Discovery & metadata (read-only)
 
 | Tool | Purpose | Input |
@@ -122,12 +135,12 @@ All tools call an external service (`openWorldHint: true`). IDs (`workspace_id`,
 | Tool | Purpose | Input | Class |
 |------|---------|-------|-------|
 | `zoho_query_data` | **The headline tool** — run an ad-hoc SQL `SELECT`. Creates an async bulk export job from your SQL, polls it to completion, downloads & parses the rows | `workspace_id`, `sql_query`, `max_rows?`, `timeout_seconds?` | read-only |
-| `zoho_export_data` | Synchronously export a table/view's rows (optionally filtered/projected) as parsed rows | `workspace_id`, `view_id`, `criteria?`, `selected_columns?`, `response_format?`, `max_rows?` | read-only |
-| `zoho_create_export_job` | Start an **async** export (by SQL or by view) for large results; returns a `job_id` | `workspace_id`, `sql_query?`/`view_id?`, `response_format?`, `criteria?` | read-only · not idempotent |
-| `zoho_get_export_job` | Check an export job (`1001`/`1002` running · `1003` **failed** · `1004` done · `1005` invalid) and optionally download its data | `workspace_id`, `job_id`, `download?`, `max_rows?` | read-only |
+| `zoho_read_view_data` | Synchronously export a table/view's rows (optionally filtered/projected) as parsed rows | `workspace_id`, `view_id`, `criteria?`, `selected_columns?`, `response_format?`, `max_rows?` | read-only |
+| `zoho_query_data_async` | Start an **async** export (by SQL or by view) for large results; returns a `job_id` | `workspace_id`, `sql_query?`/`view_id?`, `response_format?`, `criteria?` | read-only · not idempotent |
+| `zoho_get_query_job` | Check an export job (`1001`/`1002` running · `1003` **failed** · `1004` done · `1005` invalid) and optionally download its data | `workspace_id`, `job_id`, `download?`, `max_rows?` | read-only |
 | `zoho_get_import_job` | Check an import job's status + summary | `workspace_id`, `job_id` | read-only |
 
-> **Sync vs. async export.** `zoho_export_data` is synchronous and convenient, but Zoho disallows it for views over 1,000,000 rows, live-connect workspaces, and Dashboard/Query-Table views. For those — and for ad-hoc SQL — use `zoho_query_data` (waits inline) or `zoho_create_export_job` + `zoho_get_export_job` (for results too big to wait on).
+> **Sync vs. async export.** `zoho_read_view_data` is synchronous and convenient, but Zoho disallows it for views over 1,000,000 rows, live-connect workspaces, and Dashboard/Query-Table views. For those — and for ad-hoc SQL — use `zoho_query_data` (waits inline) or `zoho_query_data_async` + `zoho_get_query_job` (for results too big to wait on).
 
 ### Writes (gated by `MCP_READONLY`)
 
@@ -167,7 +180,7 @@ Org: `zoho_list_users`, `zoho_add_users`, `zoho_remove_users`, `zoho_set_users_s
 
 ### Dependents, formulas & analysis
 
-Reads: `zoho_get_dependents` (view/column), `zoho_list_formula_columns`, `zoho_list_aggregate_formulas`, `zoho_get_aggregate_formula_value`, `zoho_get_aggregate_formula_dependents`, `zoho_get_last_import_details`, `zoho_export_workspace_template` (base64 ZIP). Writes: `zoho_edit_formula_column`, `zoho_edit_aggregate_formula`, `zoho_copy_formulas` (cross-workspace/org), `zoho_create_similar_views`, `zoho_auto_analyse` (view or column), folder placement (`zoho_make_default_folder`, `zoho_move_folder`, `zoho_reorder_folder`).
+Reads: `zoho_get_dependents` (view/column), `zoho_list_formula_columns`, `zoho_list_aggregate_formulas`, `zoho_get_aggregate_formula_value`, `zoho_get_aggregate_formula_dependents`, `zoho_get_last_import_details`, `zoho_get_workspace_template` (base64 ZIP). Writes: `zoho_edit_formula_column`, `zoho_edit_aggregate_formula`, `zoho_copy_formulas` (cross-workspace/org), `zoho_create_similar_views`, `zoho_auto_analyse` (view or column), folder placement (`zoho_make_default_folder`, `zoho_move_folder`, `zoho_reorder_folder`).
 
 ### Favorites, defaults & data sources
 
@@ -179,7 +192,7 @@ Reads: `zoho_get_dependents` (view/column), `zoho_list_formula_columns`, `zoho_l
 
 ### AutoML
 
-Reads: `zoho_list_automl_analysis` (org/workspace), `zoho_get_automl_analysis`, `zoho_list_automl_deployments`, `zoho_automl_whatif` (prediction for one input). Writes: `zoho_create_automl_analysis` (train models — REGRESSION/CLASSIFICATION/CLUSTERING), `zoho_create_automl_deployment`, `zoho_run_automl_deployment`, and deletes for analysis/model/deployment (all with `dry_run`).
+Reads: `zoho_list_automl_analysis` (org/workspace), `zoho_get_automl_analysis`, `zoho_list_automl_deployments`, `zoho_get_automl_prediction` (prediction for one input). Writes: `zoho_create_automl_analysis` (train models — REGRESSION/CLASSIFICATION/CLUSTERING), `zoho_create_automl_deployment`, `zoho_run_automl_deployment`, and deletes for analysis/model/deployment (all with `dry_run`).
 
 ### Operational modes
 
@@ -201,13 +214,13 @@ The tools map onto these Zoho Analytics v2 endpoints (relative to `https://<api-
 | `zoho_list_views` | `GET /workspaces/{workspace-id}/views` |
 | `zoho_get_view_details` / `zoho_describe_workspace` | `GET /views/{view-id}` (`withInvolvedMetaInfo`) |
 | `zoho_get_metadata` | `GET /metadetails` |
-| `zoho_export_data` | `GET /workspaces/{workspace-id}/views/{view-id}/data` |
+| `zoho_read_view_data` | `GET /workspaces/{workspace-id}/views/{view-id}/data` |
 | `zoho_add_row` | `POST /workspaces/{workspace-id}/views/{view-id}/rows` |
 | `zoho_update_rows` | `PUT /workspaces/{workspace-id}/views/{view-id}/rows` |
 | `zoho_delete_rows` | `DELETE /workspaces/{workspace-id}/views/{view-id}/rows` |
-| `zoho_query_data` / `zoho_create_export_job` (SQL) | `GET /bulk/workspaces/{workspace-id}/data` (`sqlQuery`) |
-| `zoho_create_export_job` (view) | `GET /bulk/workspaces/{workspace-id}/views/{view-id}/data` |
-| `zoho_get_export_job` | `GET /bulk/workspaces/{workspace-id}/exportjobs/{job-id}` (+ `/data` to download) |
+| `zoho_query_data` / `zoho_query_data_async` (SQL) | `GET /bulk/workspaces/{workspace-id}/data` (`sqlQuery`) |
+| `zoho_query_data_async` (view) | `GET /bulk/workspaces/{workspace-id}/views/{view-id}/data` |
+| `zoho_get_query_job` | `GET /bulk/workspaces/{workspace-id}/exportjobs/{job-id}` (+ `/data` to download) |
 | `zoho_import_data` | `POST /bulk/workspaces/{workspace-id}/views/{view-id}/data` (multipart `FILE`) |
 | `zoho_get_import_job` | `GET /bulk/workspaces/{workspace-id}/importjobs/{job-id}` |
 | `zoho_create_workspace` | `POST /workspaces` |
@@ -417,7 +430,7 @@ npx wrangler deploy -c wrangler.oauth.jsonc
 ## Caveats
 
 - **Bring your own OAuth app.** You need a registered Zoho client and a refresh token (see [Getting Zoho OAuth credentials](#getting-zoho-oauth-credentials)). `ZOHO_DC` must match the data center your account lives in, or token refresh fails.
-- **Ad-hoc SQL is async.** Zoho runs ad-hoc SQL through a bulk export *job*. `zoho_query_data` hides this (create → poll → download) but bounds its wait (default 50s, cap 120s; Zoho jobs routinely take 30–90s); for very large result sets it returns a `job_id` to poll with `zoho_get_export_job`.
+- **Ad-hoc SQL is async.** Zoho runs ad-hoc SQL through a bulk export *job*. `zoho_query_data` hides this (create → poll → download) but bounds its wait (default 50s, cap 120s; Zoho jobs routinely take 30–90s); for very large result sets it returns a `job_id` to poll with `zoho_get_query_job`.
 - **API units & frequency limits.** Calls consume daily API units and are subject to per-minute frequency limits (≈100 req/min overall). Batch tools use bounded concurrency, but heavy use can still hit quota errors (`6043`/`6044`/`6045`).
 - **Large tool surface.** Full coverage means ~144 tools. That's a lot for one connector — if your client struggles with the count or you only need reporting, deploy with `MCP_READONLY=true` for the ~51 read tools. Advanced/long-tail CONFIG keys on the modeling, sharing, publish, and variable tools are passed through an `options` object (documented per tool) rather than enumerated as parameters.
 - **OAuth worker: single-user by default, multi-user opt-in.** Out of the box the OAuth worker gates on one shared passphrase and acts with one worker-wide Zoho token — fine for a personal connector. Set `ZOHO_MULTI_USER=true` (with a *server-based* Zoho client whose redirect URI is `<origin>/zoho/callback`) to make the consent screen a real per-user Zoho login: each user's own refresh token is held in the encrypted OAuth grant, access-token and schema caches are namespaced per user, and the server acts as — and is rate-limited per — that user. Multi-user mode ships off and, while it has its own end-to-end consent + isolation tests, has not been exercised against a live multi-tenant org — validate it before relying on it.
@@ -436,14 +449,18 @@ src/
   tools.ts          registerTools() — 100+ tool definitions + Zod schemas + helpers (shared)
   zohoanalytics.ts  ZohoAnalyticsClient — dependency-free REST client (fetch-only): OAuth refresh,
                     CONFIG-param + envelope handling, DC routing, retry/backoff, mapLimit (shared)
-tests/              vitest unit tests (client OAuth/retry/DC/CONFIG, helpers)
+  version.ts        VERSION + MCP server instructions (single source)
+  health.ts         GET /health body (shared by both workers)
+tests/              vitest (no network): client, helpers, tool-surface contract, version mirror
 vitest.config.ts    test config (resolves NodeNext .js specifiers to .ts)
 scripts/smoke.mjs     smoke test against a deployed worker (npm run smoke); auto-detects CORE/READONLY modes
 scripts/live-test.mjs guarded LIVE write-path integration test (MCP_URL + MCP_TOKEN + LIVE_WRITE=1) —
                       creates a disposable table, exercises rows/SQL/dry-runs, cleans up via trash + purge
-.github/workflows/ci.yml      CI — typecheck + tests + syntax checks for both scripts on push/PR
+.github/workflows/ci.yml      CI — typecheck + tests + script syntax checks + dry-run bundle of both workers, every push/PR
 .github/workflows/deploy.yml  gated manual deploy (typecheck + tests -> wrangler deploy -> live smoke); needs CLOUDFLARE_API_TOKEN secret
 wrangler.jsonc        bearer worker config (zoho-analytics-mcp)
 wrangler.oauth.jsonc  OAuth worker config (zoho-analytics-mcp-oauth) — adds OAUTH_KV
-package.json          deps (SDK ^1.29.0, agents ^0.14.5, zod ^4, workers-oauth-provider, wrangler, vitest)
+package.json          deps (SDK 1.32.1, agents 0.30.1 — pinned; zod ^4, workers-oauth-provider, wrangler, vitest)
+CLAUDE.md             guide for AI coding agents working on this repo
+.dev.vars.example     template for local secrets (npm run dev)
 ```
