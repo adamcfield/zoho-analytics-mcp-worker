@@ -12,6 +12,10 @@
  *   - MULTI-USER (ZOHO_MULTI_USER=true): the approval click hands off to a real
  *     Zoho login (authorization-code flow); each user's own refresh token is
  *     stored in the encrypted OAuth grant props and the server acts as them.
+ *   - BRING YOUR OWN CLIENT (on unless MCP_BYO_KEYS="false"): shown next to either
+ *     mode. The user pastes their OWN Zoho API client (id + secret + data center) and a
+ *     Self Client grant code, or signs in on Zoho with their own server-based client.
+ *     None of the operator's ZOHO_* secrets are used for them (src/byo.ts).
  *
  * Routes:
  *   GET  /                         health check (no auth)
@@ -39,6 +43,7 @@ import { ZohoAnalyticsClient, kvTokenStore, DC_DOMAINS, constantTimeEqual } from
 import { VERSION, MCP_INSTRUCTIONS } from "./version.js";
 import { healthBody, healthResponse } from "./health.js";
 import { registerTools, registerResourcesAndPrompts } from "./tools.js";
+import { ZOHO_SCOPE, accountsOrigin, defaultOrgId, exchangeCode, openParked, parseSealedState, readByoForm, sealParked, type ByoClient } from "./byo.js";
 
 // Reuses the bearer worker's global Cloudflare.Env (MCP_OBJECT, ZOHO_*, etc.)
 // and adds the OAuth-specific bindings.
@@ -57,9 +62,17 @@ interface Env extends Cloudflare.Env {
    * single-user shared-passphrase consent is used.
    */
   ZOHO_MULTI_USER?: string;
+  /** "false" (exact) hides "Use your own Zoho API client". */
+  MCP_BYO_KEYS?: string;
 }
 
-type Props = { user: string; zohoRefreshToken?: string };
+/**
+ * `zohoRefreshToken`: a per-user refresh token (multi-user or bring-your-own).
+ * `cid`/`cs`/`dc`/`org`: bring-your-own grants only — the user's OWN Zoho client, data
+ * center and org. Such a grant never falls back to the operator's ZOHO_* values.
+ */
+type Props = { user: string; zohoRefreshToken?: string; cid?: string; cs?: string; dc?: string; org?: string };
+const byoEnabled = (env: Env): boolean => env.MCP_BYO_KEYS !== "false";
 type AuthRequest = Awaited<ReturnType<OAuthHelpers["parseAuthRequest"]>>;
 
 /** The MCP agent — identical tool surface to the bearer worker. */
@@ -73,11 +86,17 @@ export class ZohoAnalyticsMCP extends McpAgent<Env, unknown, Props> {
     const userRefreshToken = props?.zohoRefreshToken;
     const refreshToken = userRefreshToken ?? this.env.ZOHO_REFRESH_TOKEN;
     const accessToken = userRefreshToken ? undefined : this.env.ZOHO_ACCESS_TOKEN;
+    // Bring-your-own grants carry their own client, DC and org; everyone else uses the worker's.
+    const own = !!(props?.cid && props?.cs);
+    const clientId = own ? props!.cid! : this.env.ZOHO_CLIENT_ID;
+    const clientSecret = own ? props!.cs! : this.env.ZOHO_CLIENT_SECRET;
+    const dc = own ? props!.dc ?? "com" : this.env.ZOHO_DC;
+    const orgId = own ? props!.org : this.env.ZOHO_ORG_ID;
 
     // A grant with no usable credentials (e.g. a stale passphrase grant in a
     // multi-user-only deployment) must not 500 the session — register an empty,
     // explanatory surface instead.
-    const hasCreds = !!accessToken || !!(refreshToken && this.env.ZOHO_CLIENT_ID && this.env.ZOHO_CLIENT_SECRET);
+    const hasCreds = !!accessToken || !!(refreshToken && clientId && clientSecret);
     if (!hasCreds) {
       this.server.registerTool(
         "zoho_reauthorize_required",
@@ -99,22 +118,23 @@ export class ZohoAnalyticsMCP extends McpAgent<Env, unknown, Props> {
     // another whose Zoho identity lacks access to that workspace.
     const cachePrefix = userRefreshToken ? `u:${props?.user ?? "grant"}:` : "";
     const client = new ZohoAnalyticsClient({
-      clientId: this.env.ZOHO_CLIENT_ID,
-      clientSecret: this.env.ZOHO_CLIENT_SECRET,
+      clientId,
+      clientSecret,
       refreshToken,
       accessToken,
-      orgId: this.env.ZOHO_ORG_ID,
-      dc: this.env.ZOHO_DC,
-      analyticsBaseUrl: this.env.ZOHO_ANALYTICS_BASE_URL,
-      accountsBaseUrl: this.env.ZOHO_ACCOUNTS_BASE_URL,
+      orgId,
+      dc,
+      // A bring-your-own client talks to its own DC, never the operator's URL overrides.
+      analyticsBaseUrl: own ? undefined : this.env.ZOHO_ANALYTICS_BASE_URL,
+      accountsBaseUrl: own ? undefined : this.env.ZOHO_ACCOUNTS_BASE_URL,
       maxRetries: this.env.ZOHO_MAX_RETRIES ? Number(this.env.ZOHO_MAX_RETRIES) : undefined,
       // Cached access tokens are namespaced per grant in multi-user mode —
       // users must never share access tokens. Zoho caps mints ~10/10min/token.
       tokenStore: kvTokenStore(this.env.OAUTH_KV, userRefreshToken ? (props?.user ?? "grant") : ""),
     });
     registerTools(this.server, client, {
-      orgId: this.env.ZOHO_ORG_ID,
-      dc: this.env.ZOHO_DC ?? "com",
+      orgId,
+      dc: dc ?? "com",
       readOnly: this.env.MCP_READONLY === "true",
       core: this.env.MCP_CORE === "true",
       cache: {
@@ -161,6 +181,8 @@ function consentPage(
   clientName: string,
   error: string | null,
   mode: "passphrase" | "zoho" = "passphrase",
+  byo: { on: boolean; origin: string; error?: string | null } = { on: false, origin: "" },
+  status?: number,
 ): Response {
   const req = b64encodeUtf8(JSON.stringify(reqInfo));
   const field =
@@ -186,7 +208,7 @@ function consentPage(
   p { color: #9aa0aa; font-size: 14px; margin: 0 0 18px; }
   .client { color: #e7e9ee; font-weight: 600; }
   label { display: block; font-size: 13px; margin: 0 0 6px; color: #c2c7d0; }
-  input[type=password] { width: 100%; padding: 11px 12px; border-radius: 9px; border: 1px solid #303440; background: #0e1014; color: #fff; font-size: 15px; }
+  input[type=password], input[type=text], select { width: 100%; padding: 11px 12px; border-radius: 9px; border: 1px solid #303440; background: #0e1014; color: #fff; font-size: 15px; }
   button { width: 100%; margin-top: 16px; padding: 11px; border: 0; border-radius: 9px; background: #4c6ef5; color: #fff; font-size: 15px; font-weight: 600; cursor: pointer; }
   button:hover { background: #3b5bdb; }
   .err { color: #ff8787; font-size: 13px; margin: 12px 0 0; }
@@ -202,11 +224,37 @@ function consentPage(
     ${error ? `<p class="err">${escapeHtml(error)}</p>` : ""}
     <p class="foot">${foot}</p>
   </form>
+  ${byo.on ? byoForm(req, byo.origin, byo.error ?? null) : ""}
 </body></html>`;
   return new Response(html, {
-    status: error ? 401 : 200,
+    status: status ?? (error ? 401 : 200),
     headers: { "content-type": "text/html; charset=utf-8" },
   });
+}
+
+/** The "Use your own Zoho API client" card on the consent screen. */
+function byoForm(req: string, origin: string, error: string | null): string {
+  const dcs = Object.keys(DC_DOMAINS)
+    .map((d) => `<option value="${d}">${escapeHtml(DC_DOMAINS[d].accounts)}</option>`)
+    .join("");
+  return `<form class="card" method="POST" action="/authorize" style="margin-top:14px">
+    <input type="hidden" name="req" value="${req}"><input type="hidden" name="action" value="byo">
+    <h1>Use your own Zoho API client</h1>
+    <p>Create a client at api-console.zoho.com. Claude will act as you, with your own client and permissions.</p>
+    <label for="cid">Client ID</label>
+    <input id="cid" name="client_id" type="text" autocomplete="off" required>
+    <label for="cs" style="margin-top:10px">Client secret</label>
+    <input id="cs" name="client_secret" type="password" autocomplete="off" required>
+    <label for="dc" style="margin-top:10px">Data center</label>
+    <select id="dc" name="dc">${dcs}</select>
+    <label for="org" style="margin-top:10px">Organization ID (optional; default organization if empty)</label>
+    <input id="org" name="org_id" type="text" inputmode="numeric" autocomplete="off">
+    <label for="code" style="margin-top:10px">Self Client grant code (optional)</label>
+    <input id="code" name="code" type="text" autocomplete="off">
+    <p style="margin:10px 0 0">Self Client: Generate Code with scope <b>${ZOHO_SCOPE}</b> and paste it above. Server-based client: leave the code empty and you'll sign in on Zoho; its redirect URI must be <b>${escapeHtml(origin)}/zoho/callback</b>.</p>
+    <button type="submit">Connect with my client</button>
+    ${error ? `<p class="err">${escapeHtml(error)}</p>` : ""}
+  </form>`;
 }
 
 /** Best-effort human-readable client name for the consent screen. */
@@ -292,6 +340,9 @@ async function handleZohoCallback(request: Request, env: Env): Promise<Response>
   const url = new URL(request.url);
   const code = url.searchParams.get("code");
   const state = url.searchParams.get("state") ?? "";
+  const sealedState = parseSealedState(state);
+  if (sealedState) return handleByoCallback(env, url, code, sealedState);
+  if (!multiUserEnabled(env)) return new Response("Not found", { status: 404 });
   const stored = state ? await env.OAUTH_KV.get(`authreq:${state}`) : null;
   if (!code || !stored) return new Response("Login expired or invalid — retry connecting.", { status: 400 });
   await env.OAUTH_KV.delete(`authreq:${state}`);
@@ -333,6 +384,88 @@ async function handleZohoCallback(request: Request, env: Env): Promise<Response>
   }
 }
 
+// ---- Bring your own Zoho API client ----
+
+type Parked = { req: AuthRequest; client: Omit<ByoClient, "code"> };
+
+/** The consent form blob is client-controlled: re-check the client and its redirect URI. */
+async function validClientRedirect(env: Env, reqInfo: AuthRequest): Promise<boolean> {
+  try {
+    const client = await env.OAUTH_PROVIDER.lookupClient(reqInfo.clientId);
+    return !!client && client.redirectUris.includes(reqInfo.redirectUri);
+  } catch {
+    return false;
+  }
+}
+
+/** Grant with the user's own client + refresh token in (encrypted) props. */
+async function completeByo(env: Env, reqInfo: AuthRequest, c: Omit<ByoClient, "code">, refreshToken: string, accessToken?: string) {
+  const org = c.orgId ?? (await defaultOrgId(c.dc, accessToken));
+  const user = crypto.randomUUID();
+  const props: Props = { user, zohoRefreshToken: refreshToken, cid: c.clientId, cs: c.clientSecret, dc: c.dc, ...(org ? { org } : {}) };
+  const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+    request: reqInfo,
+    userId: user,
+    metadata: { kind: "zoho-own-client" },
+    scope: reqInfo.scope ?? [],
+    props,
+  });
+  return Response.redirect(redirectTo, 302);
+}
+
+async function handleByo(request: Request, env: Env, reqInfo: AuthRequest, form: FormData): Promise<Response> {
+  const origin = new URL(request.url).origin;
+  const again = async (msg: string, status = 400) =>
+    consentPage(reqInfo, await clientName(env, reqInfo.clientId), null, multiUserEnabled(env) ? "zoho" : "passphrase", { on: true, origin, error: msg }, status);
+  if (!(await validClientRedirect(env, reqInfo))) return new Response("Invalid OAuth request", { status: 400 });
+  const ip = clientIp(request);
+  if (await isLockedOut(env, ip)) return again("Too many failed attempts. Try again later.", 429);
+
+  const parsed = readByoForm(form);
+  if ("error" in parsed) return again(parsed.error);
+  const { code, ...client } = parsed;
+
+  if (!code) {
+    // Server-based client: their own client id on Zoho's login; the client rides sealed in KV.
+    const { id, state, sealed } = await sealParked({ req: reqInfo, client } satisfies Parked);
+    await env.OAUTH_KV.put(`authreq:${id}`, sealed, { expirationTtl: 600 });
+    const auth = new URL(`${accountsOrigin(client.dc)}/oauth/v2/auth`);
+    auth.searchParams.set("scope", ZOHO_SCOPE);
+    auth.searchParams.set("client_id", client.clientId);
+    auth.searchParams.set("response_type", "code");
+    auth.searchParams.set("access_type", "offline");
+    auth.searchParams.set("prompt", "consent");
+    auth.searchParams.set("redirect_uri", `${origin}/zoho/callback`);
+    auth.searchParams.set("state", state);
+    return Response.redirect(auth.toString(), 302);
+  }
+
+  // Self Client: exchange the pasted grant code once.
+  const res = await exchangeCode(client, code, undefined);
+  if (!res.ok) {
+    if (res.error === "network") return again("Couldn't reach Zoho. Try again in a minute.", 502);
+    await recordFailedAttempt(env, ip);
+    return again(`Zoho rejected that client or code (${res.error}). Codes expire after a few minutes; generate a new one.`, 401);
+  }
+  return completeByo(env, reqInfo, client, res.refreshToken, res.accessToken);
+}
+
+async function handleByoCallback(env: Env, url: URL, code: string | null, st: { id: string; key: string }): Promise<Response> {
+  if (!byoEnabled(env)) return new Response("Not found", { status: 404 });
+  const sealed = await env.OAUTH_KV.get(`authreq:${st.id}`);
+  if (!code || !sealed) return new Response("Login expired or invalid — retry connecting.", { status: 400 });
+  await env.OAUTH_KV.delete(`authreq:${st.id}`); // single use
+  const parked = await openParked<Parked>(sealed, st.key);
+  if (!parked) return new Response("Login expired or invalid — retry connecting.", { status: 400 });
+  const res = await exchangeCode(parked.client, code, `${url.origin}/zoho/callback`);
+  if (!res.ok) return new Response(`Zoho login failed: ${res.error}. Retry connecting.`, { status: 502 });
+  try {
+    return await completeByo(env, parked.req, parked.client, res.refreshToken, res.accessToken);
+  } catch {
+    return new Response("Authorization could not be completed — retry connecting.", { status: 400 });
+  }
+}
+
 async function handleAuthorize(request: Request, env: Env): Promise<Response> {
   if (request.method === "GET") {
     let reqInfo: AuthRequest;
@@ -344,20 +477,26 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
     if (!reqInfo.clientId) return new Response("Invalid OAuth request", { status: 400 });
     // Both modes show a consent screen first (displaying the requesting client),
     // so the user explicitly approves THIS client before anything proceeds.
-    return consentPage(reqInfo, await clientName(env, reqInfo.clientId), null, multiUserEnabled(env) ? "zoho" : "passphrase");
+    return consentPage(reqInfo, await clientName(env, reqInfo.clientId), null, multiUserEnabled(env) ? "zoho" : "passphrase", {
+      on: byoEnabled(env),
+      origin: new URL(request.url).origin,
+    });
   }
 
   if (request.method === "POST") {
     let reqInfo: AuthRequest;
     let passphrase: string;
+    let form: FormData;
     try {
-      const form = await request.formData();
+      form = await request.formData();
       passphrase = String(form.get("passphrase") ?? "");
       reqInfo = JSON.parse(b64decodeUtf8(String(form.get("req") ?? ""))) as AuthRequest;
     } catch {
       return new Response("Invalid OAuth request", { status: 400 });
     }
     if (!reqInfo.clientId) return new Response("Invalid OAuth request", { status: 400 });
+
+    if (String(form.get("action") ?? "") === "byo" && byoEnabled(env)) return handleByo(request, env, reqInfo, form);
 
     // Multi-user: the consent POST IS the per-client approval — now hand off to
     // Zoho's own login. The passphrase path below is never reachable in this
@@ -375,7 +514,10 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
     // Fail closed: no passphrase configured -> reject everything.
     if (!env.APP_PASSPHRASE || !constantTimeEqual(passphrase, env.APP_PASSPHRASE)) {
       await recordFailedAttempt(env, ip);
-      return consentPage(reqInfo, await clientName(env, reqInfo.clientId), "Incorrect passphrase. Try again.");
+      return consentPage(reqInfo, await clientName(env, reqInfo.clientId), "Incorrect passphrase. Try again.", "passphrase", {
+        on: byoEnabled(env),
+        origin: new URL(request.url).origin,
+      });
     }
 
     const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
@@ -396,11 +538,15 @@ const defaultHandler = {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/authorize") return handleAuthorize(request, env);
-    if (url.pathname === "/zoho/callback" && multiUserEnabled(env)) return handleZohoCallback(request, env);
+    if (url.pathname === "/zoho/callback" && (multiUserEnabled(env) || byoEnabled(env))) return handleZohoCallback(request, env);
     if (url.pathname === "/health" && request.method === "GET") {
       const multi = multiUserEnabled(env);
-      const extra = !multi && !env.APP_PASSPHRASE ? ["APP_PASSPHRASE not set (single-user consent cannot complete)"] : [];
-      return healthResponse(healthBody(env, "oauth", extra, { perUserZoho: multi }));
+      const own = byoEnabled(env);
+      const extra = !multi && !own && !env.APP_PASSPHRASE ? ["APP_PASSPHRASE not set (single-user consent cannot complete)"] : [];
+      if (env.MCP_BYO_KEYS !== undefined && env.MCP_BYO_KEYS !== "true" && env.MCP_BYO_KEYS !== "false") {
+        extra.push(`MCP_BYO_KEYS must be exactly "true" or "false"`);
+      }
+      return healthResponse(healthBody(env, "oauth", extra, { perUserZoho: multi, ownClients: own, passphrase: !!env.APP_PASSPHRASE }));
     }
     if (url.pathname === "/" && request.method === "GET") {
       return new Response("zoho-analytics-mcp-oauth worker: ok (OAuth-gated MCP at /mcp)", {

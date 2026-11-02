@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.8.0 — Bring your own Zoho API client on the claude.ai connector
+
+### Added
+- **Use your own Zoho API client** on the OAuth worker's consent screen (shared MCP worker standard §3A). It is on by default; `MCP_BYO_KEYS="false"` hides it. A user pastes their own Zoho API Console client (ID + secret), picks their data center, optionally types an organization ID, and then either:
+  - pastes a **Self Client** grant code (scope `ZohoAnalytics.fullaccess.all`), which is exchanged once, or
+  - leaves the code empty and signs in on Zoho with a **server-based** client whose redirect URI is `<origin>/zoho/callback`.
+- The client ID/secret, refresh token, DC and org ride in the grant's props, which the OAuth provider encrypts. These grants never use the operator's `ZOHO_CLIENT_*`, `ZOHO_ORG_ID`, `ZOHO_DC` or base-URL overrides. With no org ID given, the account's default organization is used.
+- A server-based sign-in parks the client in `OAUTH_KV` sealed with a random key that only travels in the single-use `state` (`src/byo.ts`).
+- Rejected clients or codes count toward the passphrase lockout.
+- `/health` on the OAuth worker: `credentialModes`; with own clients on, the worker-wide Zoho credentials and `ZOHO_ORG_ID` are an optional fallback and no longer warn; warns when `MCP_BYO_KEYS` isn't exactly `true`/`false`.
+
 ## 1.7.0 — Dependency security update + shared MCP worker standard
 
 ### Security

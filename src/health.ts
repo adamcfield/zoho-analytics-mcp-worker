@@ -21,12 +21,13 @@ export function healthBody(
   env: HealthEnv,
   worker: "bearer" | "oauth",
   extraWarnings: string[] = [],
-  opts: { perUserZoho?: boolean } = {},
+  opts: { perUserZoho?: boolean; ownClients?: boolean; passphrase?: boolean } = {},
 ): Record<string, unknown> {
   const warnings = [...extraWarnings];
   const appCreds = !!(env.ZOHO_CLIENT_ID && env.ZOHO_CLIENT_SECRET);
   const workerCreds = !!env.ZOHO_ACCESS_TOKEN || (appCreds && !!env.ZOHO_REFRESH_TOKEN);
-  if (opts.perUserZoho ? !appCreds : !workerCreds) {
+  // With bring-your-own clients, the worker-wide Zoho credentials are an optional fallback.
+  if (!opts.ownClients && (opts.perUserZoho ? !appCreds : !workerCreds)) {
     warnings.push(
       opts.perUserZoho
         ? "ZOHO_CLIENT_ID / ZOHO_CLIENT_SECRET not set (multi-user mode needs the Zoho app credentials)"
@@ -34,7 +35,7 @@ export function healthBody(
     );
   }
   if (env.ZOHO_ACCESS_TOKEN) warnings.push("ZOHO_ACCESS_TOKEN is set: static token expires hourly (testing only)");
-  if (!env.ZOHO_ORG_ID) warnings.push("ZOHO_ORG_ID not set");
+  if (!env.ZOHO_ORG_ID && !opts.ownClients) warnings.push("ZOHO_ORG_ID not set");
   const dc = (env.ZOHO_DC ?? "com").toLowerCase();
   if (!(dc in DC_DOMAINS)) warnings.push(`ZOHO_DC "${env.ZOHO_DC}" is not a known data center`);
   for (const [k, v] of [["MCP_READONLY", env.MCP_READONLY], ["MCP_CORE", env.MCP_CORE]] as const) {
@@ -48,6 +49,15 @@ export function healthBody(
     readOnly: env.MCP_READONLY === "true",
     core: env.MCP_CORE === "true",
     dataCenter: dc,
+    ...(worker === "oauth"
+      ? {
+          credentialModes: [
+            ...(opts.passphrase && !opts.perUserZoho ? ["owner-passphrase"] : []),
+            ...(opts.perUserZoho ? ["zoho-user-login"] : []),
+            ...(opts.ownClients ? ["zoho-own-client"] : []),
+          ],
+        }
+      : {}),
     warnings,
   };
 }
