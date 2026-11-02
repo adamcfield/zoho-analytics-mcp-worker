@@ -59,7 +59,14 @@ export const parseJsonc = (text) => JSON.parse(stripJsonc(text));
  * Merge one base config with its Volta overlay entry. Returns { config, missing }.
  * `missing` lists every value still to be filled in; a non-empty list means "do not deploy".
  */
-export function voltaConfig(base, overlay, accountId) {
+/** Replace `{subdomain}` in var values with the Volta account's workers.dev subdomain. */
+function fillSubdomain(value, subdomain, missing) {
+  if (typeof value !== "string" || !value.includes("{subdomain}")) return value;
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(String(subdomain ?? ""))) { missing.push("workers_dev_subdomain"); return value; }
+  return value.replaceAll("{subdomain}", subdomain);
+}
+
+export function voltaConfig(base, overlay, accountId, subdomain) {
   const config = structuredClone(base);
   const missing = [];
   // Pin the Volta account explicitly: one wrangler login can see several accounts, and the base
@@ -94,7 +101,11 @@ export function voltaConfig(base, overlay, accountId) {
   }
 
   if (Array.isArray(overlay.crons)) config.triggers = { ...(config.triggers ?? {}), crons: overlay.crons };
-  if (overlay.vars) config.vars = { ...(config.vars ?? {}), ...overlay.vars };
+  if (overlay.vars) {
+    const vars = {};
+    for (const [k, v] of Object.entries(overlay.vars)) vars[k] = fillSubdomain(v, subdomain, missing);
+    config.vars = { ...(config.vars ?? {}), ...vars };
+  }
   return { config, missing };
 }
 
@@ -111,7 +122,7 @@ function main(argv) {
   const built = entries.map(([file, entry]) => {
     const basePath = join(root, file);
     const base = parseJsonc(readFileSync(basePath, "utf8"));
-    return { file, basePath, base, entry, ...voltaConfig(base, entry, overlay.account_id) };
+    return { file, basePath, base, entry, ...voltaConfig(base, entry, overlay.account_id, overlay.workers_dev_subdomain) };
   });
 
   if (mode === "plan") {
@@ -131,6 +142,7 @@ function main(argv) {
     return 0;
   }
 
+  for (const b of built) b.missing = [...new Set(b.missing)];
   const notReady = built.filter((b) => b.missing.length);
   if (notReady.length) {
     for (const b of notReady) console.log(`::notice::${b.file}: Volta overlay not filled in yet (${b.missing.join(", ")})`);

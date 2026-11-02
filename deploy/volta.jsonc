@@ -4,18 +4,23 @@
 // the workflow skips until they are filled in (`node scripts/deploy-volta.mjs --plan` prints
 // the create commands). KV ids are identifiers, not secrets. Crons stay OFF on the copy while
 // both deployments run, so scheduled side effects do not happen twice.
+// The copy is served from the Volta account's workers.dev subdomain: volta.solar is not a zone
+// on that account (decision 2026-11-02). To move to a custom domain later, replace
+// "workers_dev": true with "domain": "<host>".
 {
   // Volta Cloudflare account ("Adam@volta.solar's Account"). Set on every generated config;
   // a CLOUDFLARE_ACCOUNT_ID that disagrees is refused.
   "account_id": "bc6ba47b42d6c9cd4fed775da4baac90",
+  // The account's workers.dev subdomain (<worker>.<this>.workers.dev). Fills {subdomain} in vars.
+  "workers_dev_subdomain": "",
   "configs": {
     "wrangler.jsonc": {
-      "domain": "zoho.mcp.volta.solar",
+      "workers_dev": true,
       "kv": { "TOKEN_KV": "" },
-      "vars": { "PUBLIC_BASE_URL": "https://zoho.mcp.volta.solar" }
+      "vars": { "PUBLIC_BASE_URL": "https://zoho-analytics-mcp.{subdomain}.workers.dev" }
     },
     // Its own OAUTH_KV. On the personal account this namespace is shared with
     // github-mcp-worker; never copy it.
-    "wrangler.oauth.jsonc": { "domain": "zoho-oauth.mcp.volta.solar", "kv": { "OAUTH_KV": "" } }
+    "wrangler.oauth.jsonc": { "workers_dev": true, "kv": { "OAUTH_KV": "" } }
   }
 }
