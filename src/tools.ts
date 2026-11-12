@@ -222,6 +222,8 @@ export interface RegisterToolsOptions {
   orgId?: string;
   /** The configured data-center key (shown by zoho_whoami). */
   dc?: string;
+  /** How this session is authorized (shown by zoho_whoami): source + masked client id, never a secret. */
+  credential?: { source: string; clientId?: string };
   /** When true, write/state-changing tools are not registered at all (reporting-only deploys). */
   readOnly?: boolean;
   /**
@@ -395,6 +397,7 @@ export function registerTools(
           ok: true,
           configured_org_id: opts.orgId ?? null,
           data_center: opts.dc ?? "com",
+          ...(opts.credential ? { credential_source: opts.credential.source, ...(opts.credential.clientId ? { client_id: opts.credential.clientId } : {}) } : {}),
           orgs: orgs?.data?.orgs ?? orgs?.data ?? orgs,
         };
       }),

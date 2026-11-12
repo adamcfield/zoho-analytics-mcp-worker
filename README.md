@@ -404,9 +404,11 @@ Any HTTP MCP client works — send `Authorization: Bearer <MCP_AUTH_TOKEN>` and 
 | Route | Purpose |
 |-------|---------|
 | `GET /` | health check (no auth) |
-| `GET`/`POST` `/authorize` | passphrase consent screen |
+| `GET`/`POST` `/authorize` | consent screen (passphrase, Zoho login, or your own Zoho API client) |
+| `GET /zoho/callback` | Zoho's redirect back after a Zoho sign-in |
+| `GET`/`POST` `/managed` | claude.ai managed authorization setup (off until `ZOHO_EMA_SECRET` is set) |
 | `/token`, `/register`, `/.well-known/oauth-*` | OAuth endpoints (handled by the provider) |
-| `POST /mcp`, `GET /sse` | MCP transports, OAuth-protected |
+| `POST /mcp` | MCP transport, OAuth-protected (`/sse` is on the bearer worker only) |
 
 Deploy alongside the bearer worker:
 
@@ -425,6 +427,18 @@ npx wrangler deploy -c wrangler.oauth.jsonc
 ```
 
 `APP_PASSPHRASE` fails closed — if unset, the consent screen rejects every attempt. Then add the connector in Claude.ai per [Claude Web](#claude-web).
+
+### Managed authorization (one Zoho account for a whole Claude organisation)
+
+A Claude Team/Enterprise owner can connect Zoho Analytics once for every member; members then use the connector without signing in.
+
+1. Set the seal secret once (it encrypts every setup; never rotate it):
+   `openssl rand -base64 32 | tr -d '\n' | npx wrangler secret put ZOHO_EMA_SECRET -c wrangler.oauth.jsonc`
+2. In Claude: Organization settings → Connectors → add `https://<worker>/mcp` → **Managed authorization**; copy the **Issuer URL**.
+3. Open `https://<worker>/managed`: paste the Issuer URL, optionally limit email domains, and give the organisation's Zoho API client (ID, secret, data center, optional organization ID) plus a Self Client grant code (scope `ZohoAnalytics.fullaccess.all`), or leave the code empty to sign in on Zoho with a server-based client (redirect URI `https://<worker>/zoho/callback`).
+4. Paste the **Tenant ID** it shows into Claude and click **Test connection**.
+
+Members act as the Zoho user who authorized the client, with that user's permissions; `zoho_whoami` shows `credential_source: "managed"`. All members share one access-token cache (Zoho allows ~10 token mints per 10 minutes per refresh token). Changing or removing a setup (`/managed?manage=1`) needs the Tenant ID and the same client ID + secret.
 
 ---
 
