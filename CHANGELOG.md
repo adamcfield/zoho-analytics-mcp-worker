@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.9.0 — claude.ai managed authorization (organisation-wide connection)
+
+### Added
+- **Managed authorization** on the OAuth worker (shared MCP worker standard §3C): a Claude Team/Enterprise owner opens `/managed`, pastes Claude's Issuer URL and binds the organisation's own Zoho API client (Self Client grant code, or a Zoho sign-in with a server-based client). The worker checks it with the same call `zoho_whoami` makes (list organizations; a given organization ID must be one of them, otherwise the default one is used), seals client + refresh token in `OAUTH_KV`, and shows a Tenant ID with a copy button. Members then connect with no sign-in (ID-JAG → `/token`); their grants carry `m: true` and run exactly like an own-client grant. Every member shares one token slot, so Zoho's mint limit and the schema cache are shared. Off until `ZOHO_EMA_SECRET` is set; changing or removing a setup needs the same client ID + secret. Failed attempts count toward the per-IP lockout.
+- `zoho_whoami` returns `credential_source` (`managed`, `own_client`, `zoho_login`, `owner`; `server` on the bearer worker) and a masked `client_id` for own/managed clients.
+- Shared `src/managed-auth.ts` and `src/ui.ts` (fleet copies; `BRAND` is the Zoho Analytics logo). `/health` lists `managed` in `credentialModes` and notes when it is off (informational; `ok` is unaffected).
+
+### Changed
+- `@cloudflare/workers-oauth-provider` 0.7.2 → **1.2.4** (pinned). The provider is built per hostname with resource `<origin>/mcp`, the value existing claude.ai grants already carry, so connected users stay signed in. Client ID Metadata Documents are on (Claude registers that way for managed authorization); wrangler compat flag `global_fetch_strictly_public` added to `wrangler.oauth.jsonc`.
+- The OAuth worker no longer serves `/sse` (one resource per provider). claude.ai uses `/mcp`; the bearer worker keeps `/sse`.
+- The passphrase/code lockout moved to `src/throttle.ts`.
+
 ## 1.8.0 — Bring your own Zoho API client on the claude.ai connector
 
 ### Added

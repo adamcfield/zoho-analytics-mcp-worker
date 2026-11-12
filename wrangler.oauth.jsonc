@@ -8,7 +8,7 @@
   "name": "zoho-analytics-mcp-oauth",
   "main": "src/oauth.ts",
   "compatibility_date": "2026-10-01",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "durable_objects": {
     "bindings": [{ "name": "MCP_OBJECT", "class_name": "ZohoAnalyticsMCP" }]
   },

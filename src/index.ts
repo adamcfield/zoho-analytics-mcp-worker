@@ -135,6 +135,7 @@ export class ZohoAnalyticsMCP extends McpAgent<Env> {
     registerTools(this.server, client, {
       orgId: this.env.ZOHO_ORG_ID,
       dc: this.env.ZOHO_DC ?? "com",
+      credential: { source: "server" },
       readOnly: this.env.MCP_READONLY === "true",
       core: this.env.MCP_CORE === "true",
       ...integrationsFromEnv(this.env),

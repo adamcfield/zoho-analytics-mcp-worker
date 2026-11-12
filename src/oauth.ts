@@ -23,7 +23,8 @@
  *   GET/POST /authorize            consent screen (passphrase or Zoho-login)
  *   GET  /zoho/callback            multi-user: Zoho redirect back (this file)
  *   /token, /register, /.well-known/oauth-*   handled by OAuthProvider
- *   POST /mcp · GET /sse           MCP transports (OAuth-protected)
+ *   GET/POST /managed              claude.ai managed authorization setup (src/managed.ts)
+ *   POST /mcp                      MCP transport (OAuth-protected; the bearer worker keeps /sse)
  *
  * Secrets (wrangler secret put ... -c wrangler.oauth.jsonc):
  *   ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET   Zoho OAuth app creds (server-based app
@@ -44,6 +45,8 @@ import { VERSION, MCP_INSTRUCTIONS } from "./version.js";
 import { healthBody, healthResponse } from "./health.js";
 import { registerTools, registerResourcesAndPrompts } from "./tools.js";
 import { ZOHO_SCOPE, accountsOrigin, defaultOrgId, exchangeCode, openParked, parseSealedState, readByoForm, sealParked, type ByoClient } from "./byo.js";
+import { WINDOW_SECS, clientIp, isLockedOut, recordFailedAttempt } from "./throttle.js";
+import { credentialSource, finishManaged, handleManaged, managed, mask, managedPage, type ManagedSetup, type Props } from "./managed.js";
 
 // Reuses the bearer worker's global Cloudflare.Env (MCP_OBJECT, ZOHO_*, etc.)
 // and adds the OAuth-specific bindings.
@@ -64,14 +67,15 @@ interface Env extends Cloudflare.Env {
   ZOHO_MULTI_USER?: string;
   /** "false" (exact) hides "Use your own Zoho API client". */
   MCP_BYO_KEYS?: string;
+  /** Seals the organisation's Zoho client for managed authorization (/managed); unset = off. Never rotate. */
+  ZOHO_EMA_SECRET?: string;
 }
 
-/**
- * `zohoRefreshToken`: a per-user refresh token (multi-user or bring-your-own).
- * `cid`/`cs`/`dc`/`org`: bring-your-own grants only — the user's OWN Zoho client, data
- * center and org. Such a grant never falls back to the operator's ZOHO_* values.
+/*
+ * Props (src/managed.ts): `zohoRefreshToken` = a per-user refresh token (multi-user, own client or
+ * managed). `cid`/`cs`/`dc`/`org`: own-client and managed grants only — that client, data center and
+ * org. Such a grant never falls back to the operator's ZOHO_* values. `m`: issued by managed authorization.
  */
-type Props = { user: string; zohoRefreshToken?: string; cid?: string; cs?: string; dc?: string; org?: string };
 const byoEnabled = (env: Env): boolean => env.MCP_BYO_KEYS !== "false";
 type AuthRequest = Awaited<ReturnType<OAuthHelpers["parseAuthRequest"]>>;
 
@@ -135,6 +139,7 @@ export class ZohoAnalyticsMCP extends McpAgent<Env, unknown, Props> {
     registerTools(this.server, client, {
       orgId,
       dc: dc ?? "com",
+      credential: { source: credentialSource(props), clientId: own ? mask(clientId) : undefined },
       readOnly: this.env.MCP_READONLY === "true",
       core: this.env.MCP_CORE === "true",
       cache: {
@@ -267,46 +272,7 @@ async function clientName(env: Env, clientId: string): Promise<string> {
   }
 }
 
-// ---- Passphrase brute-force lockout (KV-backed, per client IP) ----
-// /authorize is public and the passphrase is the sole auth factor, so failed
-// attempts are throttled: MAX_ATTEMPTS failures within WINDOW_SECS locks that
-// IP out until the window expires. KV is eventually consistent (~60s), which is
-// fine for a coarse lockout — the goal is stopping brute force, not exactness.
-const MAX_ATTEMPTS = 10;
-const WINDOW_SECS = 900;
-
-function clientIp(request: Request): string {
-  const ip = request.headers.get("cf-connecting-ip") ?? "unknown";
-  // Bucket IPv6 by /64: an attacker's standard allocation is a whole /64, so
-  // per-address buckets would make the lockout trivially bypassable.
-  if (ip.includes(":")) {
-    const [head, tail = ""] = ip.split("::");
-    const headGroups = head ? head.split(":") : [];
-    const tailGroups = tail ? tail.split(":") : [];
-    const zeros = Array(Math.max(0, 8 - headGroups.length - tailGroups.length)).fill("0");
-    const full = [...headGroups, ...zeros, ...tailGroups];
-    return `${full.slice(0, 4).join(":")}::/64`;
-  }
-  return ip;
-}
-
-async function isLockedOut(env: Env, ip: string): Promise<boolean> {
-  try {
-    return Number((await env.OAUTH_KV.get(`authfail:${ip}`)) ?? 0) >= MAX_ATTEMPTS;
-  } catch {
-    return false; // a KV outage must not lock everyone out
-  }
-}
-
-async function recordFailedAttempt(env: Env, ip: string): Promise<void> {
-  try {
-    const key = `authfail:${ip}`;
-    const n = Number((await env.OAUTH_KV.get(key)) ?? 0) + 1;
-    await env.OAUTH_KV.put(key, String(n), { expirationTtl: WINDOW_SECS });
-  } catch {
-    /* best-effort */
-  }
-}
+// Passphrase / code brute-force lockout: src/throttle.ts (per client IP, KV-backed).
 
 // ---- Multi-user mode: real Zoho login on consent ----
 
@@ -386,7 +352,8 @@ async function handleZohoCallback(request: Request, env: Env): Promise<Response>
 
 // ---- Bring your own Zoho API client ----
 
-type Parked = { req: AuthRequest; client: Omit<ByoClient, "code"> };
+/** A parked Zoho sign-in: a connector consent (`req`) or a /managed setup (`managed`). */
+type Parked = { req?: AuthRequest; client: Omit<ByoClient, "code">; managed?: ManagedSetup };
 
 /** The consent form blob is client-controlled: re-check the client and its redirect URI. */
 async function validClientRedirect(env: Env, reqInfo: AuthRequest): Promise<boolean> {
@@ -419,7 +386,7 @@ async function handleByo(request: Request, env: Env, reqInfo: AuthRequest, form:
     consentPage(reqInfo, await clientName(env, reqInfo.clientId), null, multiUserEnabled(env) ? "zoho" : "passphrase", { on: true, origin, error: msg }, status);
   if (!(await validClientRedirect(env, reqInfo))) return new Response("Invalid OAuth request", { status: 400 });
   const ip = clientIp(request);
-  if (await isLockedOut(env, ip)) return again("Too many failed attempts. Try again later.", 429);
+  if (await isLockedOut(env.OAUTH_KV, ip)) return again("Too many failed attempts. Try again later.", 429);
 
   const parsed = readByoForm(form);
   if ("error" in parsed) return again(parsed.error);
@@ -444,23 +411,32 @@ async function handleByo(request: Request, env: Env, reqInfo: AuthRequest, form:
   const res = await exchangeCode(client, code, undefined);
   if (!res.ok) {
     if (res.error === "network") return again("Couldn't reach Zoho. Try again in a minute.", 502);
-    await recordFailedAttempt(env, ip);
+    await recordFailedAttempt(env.OAUTH_KV, ip);
     return again(`Zoho rejected that client or code (${res.error}). Codes expire after a few minutes; generate a new one.`, 401);
   }
   return completeByo(env, reqInfo, client, res.refreshToken, res.accessToken);
 }
 
 async function handleByoCallback(env: Env, url: URL, code: string | null, st: { id: string; key: string }): Promise<Response> {
-  if (!byoEnabled(env)) return new Response("Not found", { status: 404 });
+  if (!byoEnabled(env) && !managed.enabled(env)) return new Response("Not found", { status: 404 });
   const sealed = await env.OAUTH_KV.get(`authreq:${st.id}`);
   if (!code || !sealed) return new Response("Login expired or invalid — retry connecting.", { status: 400 });
   await env.OAUTH_KV.delete(`authreq:${st.id}`); // single use
   const parked = await openParked<Parked>(sealed, st.key);
   if (!parked) return new Response("Login expired or invalid — retry connecting.", { status: 400 });
+  if (parked.managed ? !managed.enabled(env) : !byoEnabled(env) || !parked.req) return new Response("Not found", { status: 404 });
   const res = await exchangeCode(parked.client, code, `${url.origin}/zoho/callback`);
-  if (!res.ok) return new Response(`Zoho login failed: ${res.error}. Retry connecting.`, { status: 502 });
+  if (!res.ok) {
+    const msg = `Zoho sign-in failed (${res.error}). Try again.`;
+    if (parked.managed) {
+      const m = parked.managed;
+      return managedPage({ origin: url.origin, error: msg, mode: m.tenant ? "manage" : "new", values: { issuer: m.issuer, domains: m.domains.join(", "), tenant: m.tenant, clientId: parked.client.clientId, dc: parked.client.dc, org: parked.client.orgId } }, 502);
+    }
+    return new Response(`Zoho login failed: ${res.error}. Retry connecting.`, { status: 502 });
+  }
+  if (parked.managed) return finishManaged(env, url.origin, parked.managed, parked.client, res.refreshToken, res.accessToken);
   try {
-    return await completeByo(env, parked.req, parked.client, res.refreshToken, res.accessToken);
+    return await completeByo(env, parked.req!, parked.client, res.refreshToken, res.accessToken);
   } catch {
     return new Response("Authorization could not be completed — retry connecting.", { status: 400 });
   }
@@ -504,7 +480,7 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
     if (multiUserEnabled(env)) return startZohoLogin(reqInfo, request, env);
 
     const ip = clientIp(request);
-    if (await isLockedOut(env, ip)) {
+    if (await isLockedOut(env.OAUTH_KV, ip)) {
       return new Response("Too many failed attempts. Try again later.", {
         status: 429,
         headers: { "retry-after": String(WINDOW_SECS) },
@@ -513,7 +489,7 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
 
     // Fail closed: no passphrase configured -> reject everything.
     if (!env.APP_PASSPHRASE || !constantTimeEqual(passphrase, env.APP_PASSPHRASE)) {
-      await recordFailedAttempt(env, ip);
+      await recordFailedAttempt(env.OAUTH_KV, ip);
       return consentPage(reqInfo, await clientName(env, reqInfo.clientId), "Incorrect passphrase. Try again.", "passphrase", {
         on: byoEnabled(env),
         origin: new URL(request.url).origin,
@@ -538,7 +514,8 @@ const defaultHandler = {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/authorize") return handleAuthorize(request, env);
-    if (url.pathname === "/zoho/callback" && (multiUserEnabled(env) || byoEnabled(env))) return handleZohoCallback(request, env);
+    if (url.pathname === "/managed") return handleManaged(request, env);
+    if (url.pathname === "/zoho/callback" && (multiUserEnabled(env) || byoEnabled(env) || managed.enabled(env))) return handleZohoCallback(request, env);
     if (url.pathname === "/health" && request.method === "GET") {
       const multi = multiUserEnabled(env);
       const own = byoEnabled(env);
@@ -546,7 +523,9 @@ const defaultHandler = {
       if (env.MCP_BYO_KEYS !== undefined && env.MCP_BYO_KEYS !== "true" && env.MCP_BYO_KEYS !== "false") {
         extra.push(`MCP_BYO_KEYS must be exactly "true" or "false"`);
       }
-      return healthResponse(healthBody(env, "oauth", extra, { perUserZoho: multi, ownClients: own, passphrase: !!env.APP_PASSPHRASE }));
+      return healthResponse(
+        healthBody(env, "oauth", extra, { perUserZoho: multi, ownClients: own, passphrase: !!env.APP_PASSPHRASE, managed: managed.enabled(env) }),
+      );
     }
     if (url.pathname === "/" && request.method === "GET") {
       return new Response("zoho-analytics-mcp-oauth worker: ok (OAuth-gated MCP at /mcp)", {
@@ -558,13 +537,35 @@ const defaultHandler = {
   },
 };
 
-export default new OAuthProvider({
-  apiHandlers: {
-    "/mcp": ZohoAnalyticsMCP.serve("/mcp"),
-    "/sse": ZohoAnalyticsMCP.serveSSE("/sse"),
+/**
+ * One provider per hostname (personal and Volta copies), built on first use. The resource is
+ * `<origin>/mcp`: the value claude.ai's grants carry (provider 0.7.2 advertised the metadata of the
+ * path the client called, and claude.ai connects to /mcp). Keep it, or every connected user is
+ * signed out. OAuth on /sse was dropped in 1.9.0 (one resource per provider; the bearer worker keeps /sse).
+ */
+const providers = new Map<string, OAuthProvider<Env>>();
+function providerFor(origin: string, env: Env): OAuthProvider<Env> {
+  const key = `${origin}|${managed.enabled(env) ? "ema" : ""}`;
+  let p = providers.get(key);
+  if (!p) {
+    p = new OAuthProvider<Env>({
+      apiHandlers: { "/mcp": ZohoAnalyticsMCP.serve("/mcp") as never },
+      defaultHandler: defaultHandler as never,
+      resourceMetadata: { resource: `${origin}/mcp`, resource_name: "Zoho Analytics MCP" },
+      authorizeEndpoint: "/authorize",
+      tokenEndpoint: "/token",
+      clientRegistrationEndpoint: "/register",
+      // §3C: Claude registers by Client ID Metadata Document (needs global_fetch_strictly_public).
+      clientIdMetadataDocumentEnabled: true,
+      enterpriseManagedAuthorization: managed.emaOptions(env),
+    });
+    providers.set(key, p);
+  }
+  return p;
+}
+
+export default {
+  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return providerFor(new URL(request.url).origin, env).fetch(request, env, ctx);
   },
-  defaultHandler: defaultHandler as never,
-  authorizeEndpoint: "/authorize",
-  tokenEndpoint: "/token",
-  clientRegistrationEndpoint: "/register",
-});
+};

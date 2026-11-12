@@ -31,6 +31,10 @@ Workers, 144 tools (51 read). Two deployments from one codebase:
 - `scripts/smoke.mjs` (post-deploy, `MCP_URL` + `MCP_TOKEN`), `scripts/live-test.mjs`
   (guarded live write-path test against a real org — creates and deletes a disposable table).
 
+## Managed authorization (standard §3C)
+- `src/managed-auth.ts` and `src/ui.ts` are fleet copies: never edit them here alone (only `BRAND` in ui.ts is ours). `/managed` lives in `src/managed.ts` (Node-testable, `tests/managed.test.ts`); a server-based Zoho sign-in for it comes back through `/zoho/callback` in `src/oauth.ts` (`parked.managed` → `finishManaged`). Grants carry `{user: "org-<slot>", zohoRefreshToken, cid, cs, dc, org, m: true}`; `slot` is shared by the whole org (one token cache). On only with `ZOHO_EMA_SECRET`; never rotate it.
+- `src/oauth.ts` builds one provider per hostname with resource `<origin>/mcp`, the value existing grants carry: never change it. OAuth `/sse` was dropped in 1.9.0.
+
 ## Rules when adding or changing tools
 - Name `zoho_<verb>_<noun>`. **`readOnlyHint: true` iff the verb is in `READ_VERBS`** — the
   Google Chat bot and other read-only consumers rely on both signals. Set all four annotations
@@ -62,9 +66,8 @@ a `## <v> — …` entry at the top of `CHANGELOG.md`, all in the same commit.
 - npm 10.9 hits `Cannot read properties of null (reading 'edgesOut')` on this lockfile —
   regenerate with `npx npm@11 install`. Never commit a `--legacy-peer-deps` lock (drops peers,
   breaks the bundle while typecheck stays green).
-- `@cloudflare/workers-oauth-provider` is still 0.7.2. 1.x requires `resourceMetadata`
-  (audience-bound tokens) and may invalidate live grants; upgrade it in its own PR and re-test
-  the claude.ai connector.
+- `@cloudflare/workers-oauth-provider` is 1.2.4 (pinned). 1.x audience-binds tokens to
+  `resourceMetadata.resource`; it stays `<origin>/mcp` (what 0.7.2 issued grants for).
 - Zoho's live API returns view types as name strings ("Table"), not the documented numeric
   codes — use `isTabularViewType` / `readableViewType`.
 - `tools/list` is ours (`installListing`): it must run after all tools are registered and must

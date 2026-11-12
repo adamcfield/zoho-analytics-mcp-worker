@@ -15,6 +15,9 @@ MCP_AUTH_TOKEN=
 # OAuth worker (single-user mode): consent-screen passphrase
 APP_PASSPHRASE=
 
+# OAuth worker: claude.ai managed authorization (/managed). Seals every setup; never rotate.
+# ZOHO_EMA_SECRET=
+
 # Optional surface flags (exactly "true" enables)
 # MCP_READONLY=true
 # MCP_CORE=true

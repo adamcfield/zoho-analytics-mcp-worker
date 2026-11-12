@@ -124,6 +124,25 @@ export async function exchangeCode(
   return { ok: true, refreshToken: data.refresh_token, accessToken: data.access_token };
 }
 
+/** The organizations this access token can see (the same call zoho_whoami / zoho_get_orgs make); null if unreachable. */
+export async function fetchOrgs(
+  dc: string,
+  accessToken: string,
+  fetchImpl: typeof fetch = fetch.bind(globalThis),
+): Promise<Array<{ orgId: string; isDefault: boolean }> | null> {
+  try {
+    const res = await fetchImpl(`${analyticsOrigin(dc)}/restapi/v2/orgs`, {
+      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { data?: { orgs?: Array<{ orgId?: string | number; isDefault?: boolean }> } };
+    return (j.data?.orgs ?? []).filter((o) => o.orgId !== undefined).map((o) => ({ orgId: String(o.orgId), isDefault: !!o.isDefault }));
+  } catch {
+    return null;
+  }
+}
+
 /** Best-effort: the account's default (else first) organization id, or undefined. */
 export async function defaultOrgId(
   dc: string,
@@ -131,17 +150,6 @@ export async function defaultOrgId(
   fetchImpl: typeof fetch = fetch.bind(globalThis),
 ): Promise<string | undefined> {
   if (!accessToken) return undefined;
-  try {
-    const res = await fetchImpl(`${analyticsOrigin(dc)}/restapi/v2/orgs`, {
-      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!res.ok) return undefined;
-    const j = (await res.json()) as { data?: { orgs?: Array<{ orgId?: string | number; isDefault?: boolean }> } };
-    const orgs = j.data?.orgs ?? [];
-    const pick = orgs.find((o) => o.isDefault) ?? orgs[0];
-    return pick?.orgId !== undefined ? String(pick.orgId) : undefined;
-  } catch {
-    return undefined;
-  }
+  const orgs = await fetchOrgs(dc, accessToken, fetchImpl);
+  return (orgs?.find((o) => o.isDefault) ?? orgs?.[0])?.orgId;
 }

@@ -1,6 +1,6 @@
 {
   "name": "zoho-analytics-mcp-worker",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -13,7 +13,7 @@
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
-    "@cloudflare/workers-oauth-provider": "^0.7.2",
+    "@cloudflare/workers-oauth-provider": "1.2.4",
     "@modelcontextprotocol/client": "2.3.1",
     "@modelcontextprotocol/sdk": "1.32.1",
     "@modelcontextprotocol/server": "2.3.1",

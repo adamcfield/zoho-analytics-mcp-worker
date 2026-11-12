@@ -21,7 +21,7 @@ export function healthBody(
   env: HealthEnv,
   worker: "bearer" | "oauth",
   extraWarnings: string[] = [],
-  opts: { perUserZoho?: boolean; ownClients?: boolean; passphrase?: boolean } = {},
+  opts: { perUserZoho?: boolean; ownClients?: boolean; passphrase?: boolean; managed?: boolean } = {},
 ): Record<string, unknown> {
   const warnings = [...extraWarnings];
   const appCreds = !!(env.ZOHO_CLIENT_ID && env.ZOHO_CLIENT_SECRET);
@@ -41,6 +41,8 @@ export function healthBody(
   for (const [k, v] of [["MCP_READONLY", env.MCP_READONLY], ["MCP_CORE", env.MCP_CORE]] as const) {
     if (v !== undefined && v !== "" && v !== "true" && v !== "false") warnings.push(`${k}="${v}" is ignored (only "true" enables it)`);
   }
+  // Informational only: managed authorization is optional, so it never flips `ok`.
+  const notes = worker === "oauth" && opts.managed === false ? ["managed authorization off (set ZOHO_EMA_SECRET to enable /managed)"] : [];
   return {
     ok: warnings.length === 0,
     service: "zoho-analytics-mcp",
@@ -55,10 +57,11 @@ export function healthBody(
             ...(opts.passphrase && !opts.perUserZoho ? ["owner-passphrase"] : []),
             ...(opts.perUserZoho ? ["zoho-user-login"] : []),
             ...(opts.ownClients ? ["zoho-own-client"] : []),
+            ...(opts.managed ? ["managed"] : []),
           ],
         }
       : {}),
-    warnings,
+    warnings: [...warnings, ...notes],
   };
 }
 
