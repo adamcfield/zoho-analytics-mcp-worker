@@ -1,0 +1,14 @@
+// Volta Cloudflare account: parallel COPY of both workers (the personal deployments are untouched).
+// KV ids are identifiers, not secrets.
+{
+  "account_id": "bc6ba47b42d6c9cd4fed775da4baac90",
+  "workers_dev_subdomain": "volta-solar",
+  "configs": {
+    "wrangler.jsonc": {
+      "workers_dev": true,
+      "kv": { "TOKEN_KV": "3714a97fc68649faae05da4b6abffa36" },
+      "vars": { "PUBLIC_BASE_URL": "https://zoho-analytics-mcp.{subdomain}.workers.dev" }
+    },
+    "wrangler.oauth.jsonc": { "workers_dev": true, "kv": { "OAUTH_KV": "e9095a4f00a2497896b2e1768b192774" } }
+  }
+}

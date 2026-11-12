@@ -1,0 +1,47 @@
+# Deploys the parallel copy of this repo's worker(s) to the Volta Cloudflare account on every
+# push to main (owner-approved 2026-11-12). The personal deployment is untouched:
+# scripts/deploy-volta.mjs pins the Volta account id from deploy/volta.jsonc and refuses any
+# other. CLOUDFLARE_API_TOKEN (repo secret) sees both accounts. Worker secrets on the Volta copy
+# are set separately; this workflow never touches them. Fails red if it cannot deploy.
+name: Deploy (Volta copy)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-volta
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: .
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: bc6ba47b42d6c9cd4fed775da4baac90
+      WRANGLER_SEND_METRICS: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ready?
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then echo "::error::CLOUDFLARE_API_TOKEN repo secret not set; the Volta copy was NOT deployed"; exit 1; fi
+          node scripts/deploy-volta.mjs --check
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci
+      - run: node scripts/deploy-volta.mjs
+      - name: Health check
+        run: |
+          sleep 5
+          for h in zoho-analytics-mcp zoho-analytics-mcp-oauth; do
+            printf '%s ' "$h"; curl -fsS "https://$h.volta-solar.workers.dev/health" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const h=JSON.parse(s);console.log(h.version,JSON.stringify(h.warnings||[]));if(h.ok===false)process.exit(1)})'
+          done
