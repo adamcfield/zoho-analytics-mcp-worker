@@ -47,6 +47,7 @@ import { registerTools, registerResourcesAndPrompts } from "./tools.js";
 import { ZOHO_SCOPE, accountsOrigin, defaultOrgId, exchangeCode, openParked, parseSealedState, readByoForm, sealParked, type ByoClient } from "./byo.js";
 import { WINDOW_SECS, clientIp, isLockedOut, recordFailedAttempt } from "./throttle.js";
 import { credentialSource, finishManaged, handleManaged, managed, mask, managedPage, type ManagedSetup, type Props } from "./managed.js";
+export { EmaKeyStore } from "./managed-auth.js";
 
 // Reuses the bearer worker's global Cloudflare.Env (MCP_OBJECT, ZOHO_*, etc.)
 // and adds the OAuth-specific bindings.
@@ -67,8 +68,9 @@ interface Env extends Cloudflare.Env {
   ZOHO_MULTI_USER?: string;
   /** "false" (exact) hides "Use your own Zoho API client". */
   MCP_BYO_KEYS?: string;
-  /** Seals the organisation's Zoho client for managed authorization (/managed); unset = off. Never rotate. */
+  /** Optional seal key for managed authorization (/managed); unset = the generated key in EMA_KEYS. Never rotate. */
   ZOHO_EMA_SECRET?: string;
+  EMA_KEYS?: DurableObjectNamespace;
 }
 
 /*

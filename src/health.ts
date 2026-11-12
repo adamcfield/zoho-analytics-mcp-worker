@@ -42,7 +42,7 @@ export function healthBody(
     if (v !== undefined && v !== "" && v !== "true" && v !== "false") warnings.push(`${k}="${v}" is ignored (only "true" enables it)`);
   }
   // Informational only: managed authorization is optional, so it never flips `ok`.
-  const notes = worker === "oauth" && opts.managed === false ? ["managed authorization off (set ZOHO_EMA_SECRET to enable /managed)"] : [];
+  const notes = worker === "oauth" && opts.managed === false ? ["managed authorization off (bind the EMA_KEYS Durable Object or set ZOHO_EMA_SECRET to enable /managed)"] : [];
   return {
     ok: warnings.length === 0,
     service: "zoho-analytics-mcp",
