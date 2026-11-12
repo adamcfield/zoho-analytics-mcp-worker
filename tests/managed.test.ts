@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { credentialSource, finishManaged, handleManaged, managed, mask, type Props } from "../src/managed.js";
 import { exchangeCode, openParked, parseSealedState } from "../src/byo.js";
 import { healthBody } from "../src/health.js";
+import { EmaKeyStore } from "../src/managed-auth.js";
 
 /**
  * src/oauth.ts imports agents (Workers runtime only). This builds the same provider from the same
@@ -36,6 +37,25 @@ type Env = Record<string, any>;
 const ctx = { waitUntil() {}, passThroughOnException() {}, props: {} } as unknown as ExecutionContext;
 
 /** Mirrors oauth.ts: /managed + the sealed /zoho/callback branch for a parked managed setup. */
+/** In-memory EMA_KEYS namespace running the real EmaKeyStore (like workerd: requests wait for blockConcurrencyWhile). */
+function keyStoreNs(storage = new Map<string, unknown>()) {
+  const objs = new Map<string, EmaKeyStore>();
+  let ready: Promise<unknown> = Promise.resolve();
+  const state = {
+    storage: { get: async (k: string) => storage.get(k) as any, put: async (k: string, v: unknown) => void storage.set(k, v) },
+    blockConcurrencyWhile: <T,>(fn: () => Promise<T>) => (ready = fn()) as Promise<T>,
+  };
+  const ns = {
+    idFromName: (n: string) => n,
+    get: (id: string) => {
+      if (!objs.has(id)) objs.set(id, new EmaKeyStore(state));
+      const o = objs.get(id)!;
+      return { fetch: async () => (await ready, o.fetch()) };
+    },
+  };
+  return { ns: ns as unknown as DurableObjectNamespace, storage };
+}
+
 function worker(env: Env) {
   const provider = new OAuthProvider({
     apiHandlers: {
@@ -201,6 +221,34 @@ describe("claude.ai managed authorization", () => {
     expect((await tokenFor(await f.sign({ client_id: clientId, email: "member@example.com", aud_tenant: tenant }))).status).toBe(400);
   });
 
+  it("needs no secret: the worker generates and keeps its own seal key", async () => {
+    const kv = memKV();
+    const ks = keyStoreNs();
+    const env: Env = { OAUTH_KV: kv, EMA_KEYS: ks.ns };
+    const w = worker(env);
+    const f = await fakes();
+    expect((await w(new Request("https://w/managed"))).status).toBe(200);
+    const meta: any = await (await w(new Request("https://w/.well-known/oauth-authorization-server"))).json();
+    expect(meta.grant_types_supported).toContain("urn:ietf:params:oauth:grant-type:jwt-bearer");
+
+    const html = await (await post(w, "/managed", { ...ORG, action: "save", code: "good" })).text();
+    const tenant = /value="(tn_[\w-]+)"/.exec(html)![1];
+    const key = ks.storage.get("ema-seal-key") as string;
+    expect(key.length).toBeGreaterThanOrEqual(43);
+    for (const v of kv._map.values()) {
+      expect(v).not.toContain("ORG-CS");
+      expect(v).not.toContain(key);
+    }
+
+    // After a restart (fresh isolate, same Durable Object storage) members still get in.
+    const w2 = worker({ ...env, EMA_KEYS: keyStoreNs(ks.storage).ns });
+    const clientId = await register(w2);
+    const res = await post(w2, "/token", { grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion: await f.sign({ client_id: clientId, email: "member@example.com", aud_tenant: tenant }), client_id: clientId, resource: RESOURCE });
+    expect(res.status).toBe(200);
+    expect(await mcp(w2, ((await res.json()) as any).access_token)).toMatchObject({ props: { cid: "ORG-CID", m: true } });
+    expect(ks.storage.get("ema-seal-key")).toBe(key);
+  });
+
   it("can sign in on Zoho's own screen with a server-based client", async () => {
     const w = worker({ OAUTH_KV: memKV(), ZOHO_EMA_SECRET: "seal-secret" });
     const f = await fakes();
@@ -238,6 +286,11 @@ describe("oauth.ts wiring", () => {
     expect(src).toMatch(/clientIdMetadataDocumentEnabled: true/);
     expect(src).toMatch(/enterpriseManagedAuthorization: managed\.emaOptions\(env\)/);
     expect(src).toMatch(/credential: \{ source: credentialSource\(props\)/);
-    expect(readFileSync("wrangler.oauth.jsonc", "utf8")).toContain("global_fetch_strictly_public");
+    const wr = readFileSync("wrangler.oauth.jsonc", "utf8");
+    expect(wr).toContain("global_fetch_strictly_public");
+    // The generated seal key: exported, bound, migrated. Never delete or rename any of it.
+    expect(src).toMatch(/export \{ EmaKeyStore \} from "\.\/managed-auth\.js"/);
+    expect(wr).toMatch(/"name": "EMA_KEYS", "class_name": "EmaKeyStore"/);
+    expect(wr).toMatch(/"new_sqlite_classes": \["EmaKeyStore"\]/);
   });
 });

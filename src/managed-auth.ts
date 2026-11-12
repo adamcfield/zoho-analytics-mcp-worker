@@ -23,6 +23,14 @@
  *   ema:i:<sha256(iss)>     → JSON array of tenantIds bound to that issuer
  * The credential is sealed with a key derived from a worker secret + the tenant id. `owner` is a
  * hash of the credential id: only someone holding the same credential can change or remove it.
+ *
+ * Seal secret, first one available wins: `sealSecretName` (a worker secret), then
+ * `fallbackSecretNames`, then (with `generatedKeyBinding`) a key the worker generates once and keeps
+ * in its own Durable Object (`EmaKeyStore` below), so no operator has to set any secret. The seal is
+ * never the access gate: a binding needs a working upstream credential to create, does nothing
+ * until a Claude org admin pastes its Tenant ID into Claude, and only the same credential can
+ * change or remove it. Never delete or rename the key store (or rotate the secret): that voids
+ * every binding.
  */
 import type { EmaOptions } from '@cloudflare/workers-oauth-provider';
 
@@ -47,6 +55,11 @@ export interface ManagedAuthOptions<C> {
   accessTokenTTL?: number;
   /** Scopes granted. Default ['mcp']. */
   scopes?: string[];
+  /**
+   * Durable Object namespace binding (env name) of an `EmaKeyStore`: the worker generates and keeps
+   * its own seal key there when no seal secret is set. Optional; without it managed auth needs a secret.
+   */
+  generatedKeyBinding?: string;
   /** KV binding. Default env.OAUTH_KV. */
   kv?: (env: any) => KVNamespace | undefined;
   /** Injected for tests. */
@@ -141,6 +154,37 @@ export function parseDomains(input: string): string[] | null {
   return [...new Set(parts)];
 }
 
+interface KeyStoreState {
+  storage: { get<T>(key: string): Promise<T | undefined>; put<T>(key: string, value: T): Promise<void> };
+  blockConcurrencyWhile<T>(fn: () => Promise<T>): Promise<T>;
+}
+
+/**
+ * Durable Object that creates 32 random bytes the first time it is asked and returns the same
+ * value forever after. Export it from the worker entry and bind it (wrangler: durable_objects
+ * binding + a new_sqlite_classes migration). Never delete or rename it.
+ */
+export class EmaKeyStore {
+  private key: string | undefined;
+  constructor(state: KeyStoreState) {
+    // Load or create before serving anything, so two first requests can't race.
+    void state.blockConcurrencyWhile(async () => {
+      let key = await state.storage.get<string>('ema-seal-key');
+      if (!key) {
+        key = b64u(crypto.getRandomValues(new Uint8Array(32)));
+        await state.storage.put('ema-seal-key', key);
+      }
+      this.key = key;
+    });
+  }
+  async fetch(): Promise<Response> {
+    return this.key ? new Response(this.key, { headers: { 'Cache-Control': 'no-store' } }) : new Response('unavailable', { status: 503 });
+  }
+}
+
+/** Fixed instance name: one key per deployment. Changing it voids every binding. */
+const KEY_STORE_INSTANCE = 'ema-seal-key-v1';
+
 export function createManagedAuth<C>(opts: ManagedAuthOptions<C>) {
   const P = opts.kvPrefix;
   const kvOf = (env: any): KVNamespace | undefined => (opts.kv ? opts.kv(env) : env?.OAUTH_KV);
@@ -150,7 +194,7 @@ export function createManagedAuth<C>(opts: ManagedAuthOptions<C>) {
   const iKey = async (iss: string) => `${P}ema:i:${(await sha256hex(iss)).slice(0, 40)}`;
   const ownerOf = async (c: C) => sha256hex(`ema-owner:${P}${opts.credentialId(c)}`);
 
-  function sealSecret(env: any): string | undefined {
+  function configuredSecret(env: any): string | undefined {
     const own = env?.[opts.sealSecretName];
     if (typeof own === 'string' && own) return own;
     for (const name of opts.fallbackSecretNames ?? []) {
@@ -160,7 +204,34 @@ export function createManagedAuth<C>(opts: ManagedAuthOptions<C>) {
     return undefined;
   }
 
-  const enabled = (env: any) => !!kvOf(env) && !!sealSecret(env);
+  const keyStoreOf = (env: any): DurableObjectNamespace | undefined => (opts.generatedKeyBinding ? env?.[opts.generatedKeyBinding] : undefined);
+  // The generated key never changes, so one lookup per isolate (per namespace) is enough.
+  const generated = new WeakMap<object, Promise<string>>();
+
+  async function sealSecret(env: any): Promise<string | undefined> {
+    const s = configuredSecret(env);
+    if (s) return s;
+    const ns = keyStoreOf(env);
+    if (!ns) return undefined;
+    let p = generated.get(ns);
+    if (!p) {
+      p = (async () => {
+        const res = await ns.get(ns.idFromName(KEY_STORE_INSTANCE)).fetch('https://ema-keys.internal/key');
+        const key = res.ok ? await res.text() : '';
+        if (key.length < 40) throw new Error(`managed-auth key store answered ${res.status}`);
+        return `generated:${key}`;
+      })();
+      p.catch(() => generated.delete(ns)); // retry on the next request instead of caching a failure
+      generated.set(ns, p);
+    }
+    try {
+      return await p;
+    } catch {
+      return undefined;
+    }
+  }
+
+  const enabled = (env: any) => !!kvOf(env) && (!!configuredSecret(env) || !!keyStoreOf(env));
 
   async function readIndex(kv: KVNamespace, iss: string): Promise<string[]> {
     try {
@@ -224,7 +295,7 @@ export function createManagedAuth<C>(opts: ManagedAuthOptions<C>) {
       },
       mapClaims: async ({ claims, env: e, requestedScope }) => {
         const kv = kvOf(e);
-        const secret = sealSecret(e);
+        const secret = await sealSecret(e);
         if (!kv || !secret) return null;
         const email = typeof claims.email === 'string' ? claims.email.trim().toLowerCase() : '';
         if (!email || !email.includes('@')) return null;
@@ -273,8 +344,10 @@ export function createManagedAuth<C>(opts: ManagedAuthOptions<C>) {
     input: { issuer: string; credential: C; domains?: string[]; tenantId?: string; verifyIssuer?: boolean },
   ): Promise<ManagedResult<{ binding: Binding }>> {
     const kv = kvOf(env);
-    const secret = sealSecret(env);
-    if (!kv || !secret) return { ok: false, error: `Managed authorization is off on this server (${opts.sealSecretName} is not set).` };
+    const secret = await sealSecret(env);
+    if (!kv || !secret) {
+      return { ok: false, error: enabled(env) ? 'The server could not load its managed-authorization key. Try again in a minute.' : `Managed authorization is off on this server (${opts.sealSecretName} is not set).` };
+    }
     const iss = normalizeIssuer(input.issuer);
     if (!iss) return { ok: false, error: `That is not a Claude Issuer URL. Copy it from Claude's "Managed authorization" dialog; it looks like https://${CLAUDE_ISSUER_HOST}/issuers/…` };
     if (input.verifyIssuer !== false && !(await issuerJwks(iss))) return { ok: false, error: 'Claude did not confirm that Issuer URL. Copy it again from the dialog.' };
@@ -319,7 +392,12 @@ export function createManagedAuth<C>(opts: ManagedAuthOptions<C>) {
   /** For /health `warnings`. Names the missing setting, never a value. */
   function healthWarnings(env: any): string[] {
     if (!kvOf(env)) return [];
-    return sealSecret(env) ? [] : [`${opts.sealSecretName} is not set: claude.ai managed authorization is off (members connect one by one).`];
+    if (enabled(env)) return [];
+    return [
+      opts.generatedKeyBinding
+        ? `claude.ai managed authorization is off: bind the ${opts.generatedKeyBinding} Durable Object (EmaKeyStore) or set ${opts.sealSecretName} (members connect one by one).`
+        : `${opts.sealSecretName} is not set: claude.ai managed authorization is off (members connect one by one).`,
+    ];
   }
 
   return { enabled, emaOptions, saveBinding, removeBinding, healthWarnings };

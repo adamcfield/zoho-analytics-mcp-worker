@@ -10,7 +10,8 @@
  * own-client grant. `slot` is shared by the whole organisation, so the access-token cache (Zoho
  * allows ~10 mints per 10 minutes per refresh token) and the schema cache are shared too.
  *
- * Off until ZOHO_EMA_SECRET is set (never rotate it: it seals every binding). Changing or removing
+ * Seal key: ZOHO_EMA_SECRET if set (never rotate it), else the worker's own generated key in the
+ * EMA_KEYS Durable Object (never delete or rename it): either seals every binding. Changing or removing
  * a setup needs the same client id + secret (the binding's owner is a hash of them).
  *
  * Node-testable: no `cloudflare:workers` import.
@@ -24,6 +25,8 @@ import { clientIp, isLockedOut, recordFailedAttempt } from "./throttle.js";
 export interface ManagedEnv {
   OAUTH_KV: KVNamespace;
   ZOHO_EMA_SECRET?: string;
+  /** Keeps the worker's own generated seal key (EmaKeyStore). Never delete or rename it. */
+  EMA_KEYS?: DurableObjectNamespace;
 }
 
 /** The organisation's Zoho credential, sealed inside the binding. */
@@ -43,6 +46,7 @@ export type Props = { user: string; zohoRefreshToken?: string; cid?: string; cs?
 export const managed = createManagedAuth<OrgCred>({
   kvPrefix: "zoho:",
   sealSecretName: "ZOHO_EMA_SECRET",
+  generatedKeyBinding: "EMA_KEYS",
   credentialId: (c) => `${c.cid}|${c.cs}`,
   toProps: (c) => ({ user: `org-${c.slot}`, zohoRefreshToken: c.rt, cid: c.cid, cs: c.cs, dc: c.dc, org: c.org, m: true }) satisfies Props,
 });

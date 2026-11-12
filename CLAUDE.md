@@ -32,7 +32,7 @@ Workers, 144 tools (51 read). Two deployments from one codebase:
   (guarded live write-path test against a real org — creates and deletes a disposable table).
 
 ## Managed authorization (standard §3C)
-- `src/managed-auth.ts` and `src/ui.ts` are fleet copies: never edit them here alone (only `BRAND` in ui.ts is ours). `/managed` lives in `src/managed.ts` (Node-testable, `tests/managed.test.ts`); a server-based Zoho sign-in for it comes back through `/zoho/callback` in `src/oauth.ts` (`parked.managed` → `finishManaged`). Grants carry `{user: "org-<slot>", zohoRefreshToken, cid, cs, dc, org, m: true}`; `slot` is shared by the whole org (one token cache). On only with `ZOHO_EMA_SECRET`; never rotate it.
+- `src/managed-auth.ts` and `src/ui.ts` are fleet copies: never edit them here alone (only `BRAND` in ui.ts is ours). `/managed` lives in `src/managed.ts` (Node-testable, `tests/managed.test.ts`); a server-based Zoho sign-in for it comes back through `/zoho/callback` in `src/oauth.ts` (`parked.managed` → `finishManaged`). Grants carry `{user: "org-<slot>", zohoRefreshToken, cid, cs, dc, org, m: true}`; `slot` is shared by the whole org (one token cache). Always on (OAuth worker): seal key = `ZOHO_EMA_SECRET` if set (never rotate it), else the worker's own generated key in the `EmaKeyStore` Durable Object (`EMA_KEYS`, exported from `src/oauth.ts`, migration `v2` in `wrangler.oauth.jsonc`; never delete/rename it or its migration).
 - `src/oauth.ts` builds one provider per hostname with resource `<origin>/mcp`, the value existing grants carry: never change it. OAuth `/sse` was dropped in 1.9.0.
 
 ## Rules when adding or changing tools
