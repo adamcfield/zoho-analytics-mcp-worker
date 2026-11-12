@@ -3,7 +3,7 @@
  * GET /health read this; tests/version.test.ts keeps package.json,
  * package-lock.json and the top CHANGELOG.md entry in lock-step with it.
  */
-export const VERSION = "1.7.0";
+export const VERSION = "1.8.0";
 
 /** MCP server instructions (standard §2.4: keep under ~900 chars). */
 export const MCP_INSTRUCTIONS =
