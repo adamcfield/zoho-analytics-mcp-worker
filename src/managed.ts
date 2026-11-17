@@ -43,7 +43,16 @@ export interface OrgCred {
 /** Grant props shared with src/oauth.ts. */
 export type Props = { user: string; zohoRefreshToken?: string; cid?: string; cs?: string; dc?: string; org?: string; m?: boolean };
 
+/**
+ * The OAuth scopes this connector issues. Advertised as `scopes_supported` in the authorization
+ * server metadata (claude.ai warns, and may skip managed authorization, when it is missing) and
+ * granted on the jwt-bearer (managed) grant, so the two never drift apart. Only advertised:
+ * no handler checks it, so grants made before it existed keep working.
+ */
+export const SCOPES = ["mcp"];
+
 export const managed = createManagedAuth<OrgCred>({
+  scopes: SCOPES,
   kvPrefix: "zoho:",
   sealSecretName: "ZOHO_EMA_SECRET",
   generatedKeyBinding: "EMA_KEYS",

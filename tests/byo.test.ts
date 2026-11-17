@@ -93,6 +93,10 @@ describe("connector wiring (source checks; oauth.ts needs the Workers runtime)",
   it("re-validates the client redirect and throttles wrong clients", () => {
     expect(src).toMatch(/async function handleByo\([\s\S]*validClientRedirect[\s\S]*isLockedOut[\s\S]*recordFailedAttempt/);
   });
+  it("advertises scopes_supported from the same list the managed grant issues", () => {
+    expect(src).toMatch(/scopesSupported: SCOPES,/);
+    expect(readFileSync("src/managed.ts", "utf8")).toMatch(/createManagedAuth<OrgCred>\(\{\n  scopes: SCOPES,/);
+  });
   it("the sign-in state is single use", () => {
     expect(src).toMatch(/OAUTH_KV\.delete\(`authreq:\$\{st\.id\}`\)/);
   });
