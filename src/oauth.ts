@@ -46,7 +46,7 @@ import { healthBody, healthResponse } from "./health.js";
 import { registerTools, registerResourcesAndPrompts } from "./tools.js";
 import { ZOHO_SCOPE, accountsOrigin, defaultOrgId, exchangeCode, openParked, parseSealedState, readByoForm, sealParked, type ByoClient } from "./byo.js";
 import { WINDOW_SECS, clientIp, isLockedOut, recordFailedAttempt } from "./throttle.js";
-import { credentialSource, finishManaged, handleManaged, managed, mask, managedPage, type ManagedSetup, type Props } from "./managed.js";
+import { credentialSource, finishManaged, handleManaged, managed, mask, managedPage, SCOPES, type ManagedSetup, type Props } from "./managed.js";
 export { EmaKeyStore } from "./managed-auth.js";
 
 // Reuses the bearer worker's global Cloudflare.Env (MCP_OBJECT, ZOHO_*, etc.)
@@ -557,6 +557,8 @@ function providerFor(origin: string, env: Env): OAuthProvider<Env> {
       authorizeEndpoint: "/authorize",
       tokenEndpoint: "/token",
       clientRegistrationEndpoint: "/register",
+      // claude.ai reads scopes_supported before managed authorization; same list the managed grant issues.
+      scopesSupported: SCOPES,
       // §3C: Claude registers by Client ID Metadata Document (needs global_fetch_strictly_public).
       clientIdMetadataDocumentEnabled: true,
       enterpriseManagedAuthorization: managed.emaOptions(env),

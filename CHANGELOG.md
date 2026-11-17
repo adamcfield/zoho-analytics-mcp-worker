@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.10.1 — 2026-11-17 — Advertise OAuth scopes for managed authorization
+
+- The OAuth worker's `/.well-known/oauth-authorization-server` now lists `scopes_supported: ["mcp"]`. claude.ai's managed-authorization test warns that a server advertising no scopes "blocks managed authorization for some users".
+- The list comes from one constant (`SCOPES`, `src/managed.ts`) that the managed (jwt-bearer) grant also issues, so what is advertised is exactly what is granted; a token request asking for another scope is narrowed to `mcp`.
+- Advertise only: no handler checks the scope, so existing personal and managed grants keep working.
+
 ## 1.10.0 — 2026-11-12 — Organisation connection with no secret to set
 
 - `/managed` (claude.ai managed authorization) is on out of the box on the OAuth worker: it generates its own seal key once and keeps it in a new Durable Object (`EMA_KEYS` → `EmaKeyStore`, migration `v2` in `wrangler.oauth.jsonc`). The org owner only pastes the Issuer URL and the organisation's Zoho client; nobody runs a terminal command.

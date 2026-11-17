@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import OAuthProvider from "@cloudflare/workers-oauth-provider";
 import { readFileSync } from "node:fs";
-import { credentialSource, finishManaged, handleManaged, managed, mask, type Props } from "../src/managed.js";
+import { credentialSource, finishManaged, handleManaged, managed, mask, SCOPES, type Props } from "../src/managed.js";
 import { exchangeCode, openParked, parseSealedState } from "../src/byo.js";
 import { healthBody } from "../src/health.js";
 import { EmaKeyStore } from "../src/managed-auth.js";
@@ -84,6 +84,7 @@ function worker(env: Env) {
     authorizeEndpoint: "/authorize",
     tokenEndpoint: "/token",
     clientRegistrationEndpoint: "/register",
+    scopesSupported: SCOPES,
     clientIdMetadataDocumentEnabled: true,
     enterpriseManagedAuthorization: managed.emaOptions(env),
   });
@@ -169,6 +170,8 @@ describe("claude.ai managed authorization", () => {
     const meta: any = await (await w(new Request("https://w/.well-known/oauth-authorization-server"))).json();
     expect(meta.grant_types_supported).toContain("urn:ietf:params:oauth:grant-type:jwt-bearer");
     expect(meta.client_id_metadata_document_supported).toBe(true);
+    // claude.ai warns ("blocks managed authorization for some users") without scopes_supported.
+    expect(meta.scopes_supported).toEqual(["mcp"]);
 
     const first = await w(new Request("https://w/managed"));
     const firstHtml = await first.text();
@@ -206,6 +209,12 @@ describe("claude.ai managed authorization", () => {
     const tok: any = await res.json();
     expect(tok.expires_in).toBe(3600);
     expect(tok.refresh_token).toBeUndefined();
+    expect(tok.scope).toBe("mcp");
+    // What Claude sends after reading scopes_supported, and an unknown scope (narrowed to mcp).
+    for (const scope of ["mcp", "read write"]) {
+      const r: any = await (await post(w, "/token", { grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion: await f.sign({ client_id: clientId, email: "member@example.com", aud_tenant: tenant }), client_id: clientId, resource: RESOURCE, scope })).json();
+      expect(r.scope).toBe("mcp");
+    }
     const a = await mcp(w, tok.access_token);
     expect(a).toMatchObject({ source: "managed", props: { zohoRefreshToken: "RT-ORG-SECRET", cid: "ORG-CID", cs: "ORG-CS", dc: "eu", org: "111", m: true } });
     expect(a.props.user).toMatch(/^org-[0-9a-f]{24}$/);
