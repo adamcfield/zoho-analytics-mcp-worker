@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.10.2 — 2026-11-23 — Connector icon in claude.ai
+
+- **Connector icon in claude.ai.** claude.ai showed the generic placeholder for this connector: it only uses a `serverInfo.icons` entry that is an inline PNG/JPEG `data:` URI, 64–128 px and under 10 KB (it never fetches an icon URL, drops SVGs, and its favicon fallback looks up `workers.dev`). `initialize` now lists the service logo that way, first (`src/server-icon.ts`, fleet copy). `test/server-icon.test.ts` pins the format and size. A connected connector may need Disconnect → Connect to show it.
+
 ## 1.10.1 — 2026-11-17 — Advertise OAuth scopes for managed authorization
 
 - The OAuth worker's `/.well-known/oauth-authorization-server` now lists `scopes_supported: ["mcp"]`. claude.ai's managed-authorization test warns that a server advertising no scopes "blocks managed authorization for some users".
