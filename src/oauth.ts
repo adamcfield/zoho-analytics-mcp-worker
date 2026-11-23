@@ -36,6 +36,8 @@
  *   MCP_READONLY, MCP_CORE
  */
 
+import { serverIcons } from "./server-icon.js";
+import { BRAND } from "./ui.js";
 import OAuthProvider from "@cloudflare/workers-oauth-provider";
 import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { McpAgent } from "agents/mcp";
@@ -83,7 +85,7 @@ type AuthRequest = Awaited<ReturnType<OAuthHelpers["parseAuthRequest"]>>;
 
 /** The MCP agent — identical tool surface to the bearer worker. */
 export class ZohoAnalyticsMCP extends McpAgent<Env, unknown, Props> {
-  server = new McpServer({ name: "zoho-analytics", version: VERSION }, { instructions: MCP_INSTRUCTIONS });
+  server = new McpServer({ name: "zoho-analytics", version: VERSION, icons: serverIcons(BRAND.logo) }, { instructions: MCP_INSTRUCTIONS });
 
   async init(): Promise<void> {
     // Multi-user grants carry the user's own refresh token in (encrypted) props;

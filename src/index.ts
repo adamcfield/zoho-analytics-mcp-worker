@@ -26,6 +26,8 @@
  *   MCP_READONLY         "true" => register read-only tools only (no add/update/delete/import/create)
  */
 
+import { serverIcons } from "./server-icon.js";
+import { BRAND } from "./ui.js";
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ZohoAnalyticsClient, kvTokenStore, signDownloadToken, verifyDownloadToken, constantTimeEqual } from "./zohoanalytics.js";
@@ -128,7 +130,7 @@ export function integrationsFromEnv(env: Env): Pick<RegisterToolsOptions, "track
 }
 
 export class ZohoAnalyticsMCP extends McpAgent<Env> {
-  server = new McpServer({ name: "zoho-analytics", version: VERSION }, { instructions: MCP_INSTRUCTIONS });
+  server = new McpServer({ name: "zoho-analytics", version: VERSION, icons: serverIcons(BRAND.logo) }, { instructions: MCP_INSTRUCTIONS });
 
   async init(): Promise<void> {
     const client = clientFromEnv(this.env);
