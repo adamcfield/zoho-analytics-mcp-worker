@@ -81,6 +81,7 @@ Two layers, kept separate:
 
 1. **Connector auth — who may call this MCP server.**
    - **Bearer worker** is gated by a **shared bearer token** (`MCP_AUTH_TOKEN`): fails closed (no secret → everything 401s), constant-time comparison. Right for programmatic use, `mcp-remote`, Claude Code/Desktop.
+   - **Bearer worker, your own Zoho client in headers** (bring your own key, since 1.11.0): send `X-Zoho-Client-Id` + `X-Zoho-Client-Secret` + `X-Zoho-Refresh-Token` (and optionally `X-Zoho-DC`, default `com`, and `X-Zoho-Org-Id`). Such a request authenticates with Zoho itself, so it needs no `MCP_AUTH_TOKEN` and never touches the worker's own `ZOHO_*` client, org, DC, URL overrides or token cache. Its access token and schema cache are keyed by a hash of client id + refresh token. This is how the team access gateway calls the worker. A bad or partial header set is a `400` (values are never echoed); `MCP_BYO_KEYS="false"` refuses it.
    - **OAuth worker** implements **OAuth 2.1** (PKCE + dynamic client registration) via [`@cloudflare/workers-oauth-provider`](https://github.com/cloudflare/workers-oauth-provider), gated by a single shared **passphrase** (`APP_PASSPHRASE`) on the consent screen — the only model Claude.ai web accepts.
 
 2. **Zoho auth — how the server calls Zoho Analytics.** The server holds your Zoho **refresh token** + **client id/secret** (`ZOHO_*` secrets) and mints short-lived access tokens at the matching accounts domain (`accounts.zoho.<dc>/oauth/v2/token`), sending them as `Authorization: Zoho-oauthtoken <token>` along with the `ZANALYTICS-ORGID` header. Tokens are cached in memory and refreshed automatically; a `401` triggers one transparent refresh-and-retry. See [Getting Zoho OAuth credentials](#getting-zoho-oauth-credentials).
@@ -257,7 +258,7 @@ Set via `npx wrangler secret put <NAME>` (secrets) or a `[vars]` block (non-secr
 | `EXPORTS` (binding) + `PUBLIC_BASE_URL` | bearer | optional | R2 spill: truncated exports persist fully and return 24h signed `/download/` URLs (enable R2 once in the dashboard, then uncomment in wrangler.jsonc) |
 | `USAGE` (binding) | bearer | optional | Workers Analytics Engine per-tool usage telemetry |
 | `RATE_LIMITER` (binding) | bearer | optional | Per-IP flood cap (300 req/min) |
-| `MCP_BYO_KEYS` | oauth | on | Exactly `"false"` hides **Use your own Zoho API client** on the consent screen |
+| `MCP_BYO_KEYS` | both | on | Exactly `"false"` hides **Use your own Zoho API client** on the consent screen (OAuth) and refuses `X-Zoho-*` header credentials (bearer) |
 | `ZOHO_MULTI_USER` | oauth | optional | `true` ⇒ per-user Zoho login on consent instead of the shared passphrase; each user's refresh token lives in encrypted grant props (needs a server-based Zoho client with redirect `<origin>/zoho/callback`) |
 
 ---
@@ -359,6 +360,12 @@ claude mcp add --transport http --scope user zoho-analytics \
   --header "Authorization: Bearer <MCP_AUTH_TOKEN>"
 
 claude mcp list   # → zoho-analytics: … (HTTP) - ✓ Connected
+
+# or with your own Zoho client (no MCP_AUTH_TOKEN needed):
+claude mcp add --transport http --scope user zoho-analytics \
+  https://zoho-analytics-mcp.<subdomain>.workers.dev/mcp \
+  --header "X-Zoho-Client-Id: <client id>" --header "X-Zoho-Client-Secret: <client secret>" \
+  --header "X-Zoho-Refresh-Token: <refresh token>" --header "X-Zoho-DC: com" --header "X-Zoho-Org-Id: <org id>"
 ```
 
 ### Claude Desktop

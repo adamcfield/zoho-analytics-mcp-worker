@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.11.0 — 2026-11-25 — Your own Zoho client in request headers
+
+- **Bring your own key on the bearer worker.** A request with `X-Zoho-Client-Id` + `X-Zoho-Client-Secret` + `X-Zoho-Refresh-Token` (optional `X-Zoho-DC`, `X-Zoho-Org-Id`) authenticates with Zoho itself: no `MCP_AUTH_TOKEN`, and none of the worker's `ZOHO_*` client, org, DC, URL overrides or token cache is used (`src/byo-headers.ts`). Until now the only header path was the operator's shared bearer token, so the team access gateway could only reach the operator's own Zoho account.
+- The credential follows each request (`__unsafe_ensureInitialized` replaces the session's props when it changes), and the Zoho access token and schema cache are keyed by a SHA-256 of client id + refresh token, so one caller's token or workspace list is never served to another.
+- A partial or malformed header set is a `400` naming the header, never its value. `MCP_BYO_KEYS="false"` refuses header credentials.
+- `zoho_whoami` reports `credential_source: own_client_header` with the masked client id.
+- `/health` on the bearer worker no longer reports missing owner secrets as a fault while BYO is on, so the Volta bearer copy (no owner secrets on purpose) turns green.
+- `tests/byo-headers.test.ts` covers parsing, refusals, cache isolation and the agents hook.
+
 ## 1.10.2 — 2026-11-23 — Connector icon in claude.ai
 
 - **Connector icon in claude.ai.** claude.ai showed the generic placeholder for this connector: it only uses a `serverInfo.icons` entry that is an inline PNG/JPEG `data:` URI, 64–128 px and under 10 KB (it never fetches an icon URL, drops SVGs, and its favicon fallback looks up `workers.dev`). `initialize` now lists the service logo that way, first (`src/server-icon.ts`, fleet copy). `test/server-icon.test.ts` pins the format and size. A connected connector may need Disconnect → Connect to show it.
