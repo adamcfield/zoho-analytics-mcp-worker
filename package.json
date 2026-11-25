@@ -1,6 +1,6 @@
 {
   "name": "zoho-analytics-mcp-worker",
-  "version": "1.10.2",
+  "version": "1.11.0",
   "private": true,
   "type": "module",
   "scripts": {

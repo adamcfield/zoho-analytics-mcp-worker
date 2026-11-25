@@ -34,6 +34,8 @@ import { ZohoAnalyticsClient, kvTokenStore, signDownloadToken, verifyDownloadTok
 import { VERSION, MCP_INSTRUCTIONS } from "./version.js";
 import { healthBody, healthResponse } from "./health.js";
 import { registerTools, registerResourcesAndPrompts, type RegisterToolsOptions } from "./tools.js";
+import { readHeaderCredential, sameCredential, credentialId, maskClientId, type HeaderCredential } from "./byo-headers.js";
+import type { TokenStore } from "./zohoanalytics.js";
 
 /** Workers Rate Limiting binding (open beta) — structural type. */
 interface RateLimit {
@@ -76,6 +78,8 @@ declare global {
       USAGE?: AnalyticsEngineDataset;
       /** Optional Workers rate-limiter: per-IP request flood cap (auth brute force is already infeasible). */
       RATE_LIMITER?: unknown;
+      /** "false" (exact) => refuse caller-supplied Zoho clients in X-Zoho-* headers. */
+      MCP_BYO_KEYS?: string;
     }
   }
 }
@@ -129,20 +133,106 @@ export function integrationsFromEnv(env: Env): Pick<RegisterToolsOptions, "track
   return { track, cache, exportStore };
 }
 
-export class ZohoAnalyticsMCP extends McpAgent<Env> {
+/** Session props: the caller's own Zoho client from X-Zoho-* headers, or {} (the worker's own). */
+type HeaderProps = Partial<HeaderCredential>;
+
+/** Token store for one header credential: keyed by a hash of client id + refresh token, never shared. */
+function headerTokenStore(kv: KVNamespace | undefined, cred: HeaderCredential): TokenStore | undefined {
+  if (!kv) return undefined;
+  const store = (async () => kvTokenStore(kv, `byo:${await credentialId(cred)}`))();
+  return {
+    get: async () => (await store).get(),
+    set: async (token, expiry) => (await store).set(token, expiry),
+  };
+}
+
+/** A client built from the caller's own Zoho client; never the worker's ZOHO_* secrets, URL overrides or cache. */
+export function clientFromHeaders(cred: HeaderCredential, env: Env): ZohoAnalyticsClient {
+  return new ZohoAnalyticsClient({
+    clientId: cred.cid,
+    clientSecret: cred.cs,
+    refreshToken: cred.rt,
+    orgId: cred.org,
+    dc: cred.dc,
+    maxRetries: env.ZOHO_MAX_RETRIES ? Number(env.ZOHO_MAX_RETRIES) : undefined,
+    tokenStore: headerTokenStore(env.TOKEN_KV, cred),
+  });
+}
+
+const isHeaderCred = (p: HeaderProps): p is HeaderCredential => !!(p.cid && p.cs && p.rt && p.dc);
+
+export class ZohoAnalyticsMCP extends McpAgent<Env, unknown, HeaderProps> {
   server = new McpServer({ name: "zoho-analytics", version: VERSION, icons: serverIcons(BRAND.logo) }, { instructions: MCP_INSTRUCTIONS });
+  private cached?: { key: HeaderProps; client: ZohoAnalyticsClient };
+
+  /** The client for the credential on THIS request (props follow each request). */
+  private current(): ZohoAnalyticsClient {
+    const p = this.props ?? {};
+    if (this.cached && sameCredential(this.cached.key, p)) return this.cached.client;
+    const client = isHeaderCred(p) ? clientFromHeaders(p, this.env) : clientFromEnv(this.env);
+    this.cached = { key: { ...p }, client };
+    return client;
+  }
 
   async init(): Promise<void> {
-    const client = clientFromEnv(this.env);
-    registerTools(this.server, client, {
-      orgId: this.env.ZOHO_ORG_ID,
-      dc: this.env.ZOHO_DC ?? "com",
-      credential: { source: "server" },
+    // Tools hold a forwarding client, so a credential change between requests of one session
+    // takes effect at once and one caller's client is never lent to another.
+    const forward = new Proxy({} as ZohoAnalyticsClient, {
+      get: (_t, k) => {
+        const c = this.current() as unknown as Record<string | symbol, unknown>;
+        const v = c[k];
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(c) : v;
+      },
+    });
+    const self = this;
+    const own = () => {
+      const p = self.props ?? {};
+      return isHeaderCred(p) ? p : undefined;
+    };
+    const integrations = integrationsFromEnv(this.env);
+    // The schema cache is per credential too: one caller's workspace list is never served to another.
+    const kv = this.env.TOKEN_KV;
+    const cache = kv
+      ? {
+          prefix: async () => {
+            const p = own();
+            return p ? `byo:${await credentialId(p)}:` : "";
+          },
+          get: async (key: string) => kv.get((await cache!.prefix()) + key),
+          put: async (key: string, value: string, ttlSecs: number) =>
+            kv.put((await cache!.prefix()) + key, value, { expirationTtl: Math.max(60, ttlSecs) }),
+        }
+      : undefined;
+    registerTools(this.server, forward, {
+      // Getters: zoho_whoami reports the credential on the current request.
+      get orgId() {
+        const p = own();
+        return p ? p.org : self.env.ZOHO_ORG_ID;
+      },
+      get dc() {
+        const p = own();
+        return p ? p.dc : (self.env.ZOHO_DC ?? "com");
+      },
+      get credential() {
+        const p = own();
+        return p ? { source: "own_client_header", clientId: maskClientId(p.cid) } : { source: "server" };
+      },
       readOnly: this.env.MCP_READONLY === "true",
       core: this.env.MCP_CORE === "true",
-      ...integrationsFromEnv(this.env),
+      ...integrations,
+      cache: cache ? { get: cache.get, put: cache.put } : undefined,
     });
-    registerResourcesAndPrompts(this.server, client);
+    registerResourcesAndPrompts(this.server, forward);
+  }
+
+  // agents hands every request's props to this hook, but onStart only stores the first. Replace
+  // the session's props whenever the presented credential differs, including back to {} for the
+  // worker's own, so the client in use is always the one on THIS request. Internal API: re-check
+  // on agents upgrades (tests/byo-headers.test.ts guards it).
+  override async __unsafe_ensureInitialized(props?: HeaderProps): Promise<void> {
+    await super.__unsafe_ensureInitialized(props);
+    const next = props ?? {};
+    if (!sameCredential(next, this.props)) await this.updateProps(next);
   }
 }
 
@@ -184,7 +274,9 @@ export default {
 
     // Structured health (no auth, no secret values): { ok, version, warnings[] }.
     if (request.method === "GET" && url.pathname === "/health") {
-      return healthResponse(healthBody(env, "bearer", env.MCP_AUTH_TOKEN ? [] : ["MCP_AUTH_TOKEN not set (every MCP call returns 401)"]));
+      const byo = env.MCP_BYO_KEYS !== "false";
+      const gate = env.MCP_AUTH_TOKEN || byo ? [] : ["MCP_AUTH_TOKEN not set (every MCP call returns 401)"];
+      return healthResponse(healthBody(env, "bearer", gate, { ownClients: byo }));
     }
 
     // Signed export downloads (capability URL — the HMAC in the query IS the auth).
@@ -214,7 +306,11 @@ export default {
       });
     }
 
-    if (!authorized(request, env)) {
+    // The caller's own Zoho client (X-Zoho-* headers) authenticates them with Zoho; otherwise the
+    // bearer gate protects the worker's own Zoho credential.
+    const own = readHeaderCredential(request.headers, env);
+    if (own && !own.ok) return Response.json({ error: own.error }, { status: 400 });
+    if (!own && !authorized(request, env)) {
       return new Response("Unauthorized", {
         status: 401,
         headers: { "www-authenticate": "Bearer" },
@@ -225,19 +321,26 @@ export default {
     // constructor would throw inside the Durable Object (an opaque 1101).
     // Surface the actual problem to the (already-authenticated) caller instead.
     const hasZohoCreds =
-      !!env.ZOHO_ACCESS_TOKEN || !!(env.ZOHO_REFRESH_TOKEN && env.ZOHO_CLIENT_ID && env.ZOHO_CLIENT_SECRET);
+      !!own || !!env.ZOHO_ACCESS_TOKEN || !!(env.ZOHO_REFRESH_TOKEN && env.ZOHO_CLIENT_ID && env.ZOHO_CLIENT_SECRET);
     if (!hasZohoCreds) {
       return new Response(
-        "Zoho credentials not configured. Set the ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET and ZOHO_REFRESH_TOKEN secrets (wrangler secret put ...) — see the README's deploy section.",
+        "Zoho credentials not configured. Send your own Zoho client in X-Zoho-Client-Id / X-Zoho-Client-Secret / X-Zoho-Refresh-Token, or set the ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET and ZOHO_REFRESH_TOKEN secrets — see the README.",
         { status: 503 },
       );
     }
 
+    const props: HeaderProps = own?.ok ? own.cred : {};
+    const sctx = {
+      waitUntil: ctx.waitUntil.bind(ctx),
+      passThroughOnException: ctx.passThroughOnException.bind(ctx),
+      props,
+    } as unknown as ExecutionContext;
+
     if (url.pathname === "/mcp") {
-      return ZohoAnalyticsMCP.serve("/mcp").fetch(request, env, ctx);
+      return ZohoAnalyticsMCP.serve("/mcp").fetch(request, env, sctx);
     }
     if (url.pathname === "/sse" || url.pathname === "/sse/message") {
-      return ZohoAnalyticsMCP.serveSSE("/sse").fetch(request, env, ctx);
+      return ZohoAnalyticsMCP.serveSSE("/sse").fetch(request, env, sctx);
     }
     return new Response("Not found", { status: 404 });
   },
